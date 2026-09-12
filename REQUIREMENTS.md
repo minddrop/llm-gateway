@@ -270,7 +270,7 @@ The gateway provides a centralized, role-based Web Portal and Dashboard serving 
 ### 5.1 Real-Time Pricing & Token Metering Engine
 The gateway computes the exact USD cost of every transaction upon stream completion using a synchronized in-memory provider pricing card:
 
-$$\text{Cost}_{\text{Total}} = (T_{\text{in}} \times P_{\text{in}}) + (T_{\text{cached\_read}} \times P_{\text{cached\_read}}) + (T_{\text{cached\_write}} \times P_{\text{cached\_write}}) + (T_{\text{out}} \times P_{\text{out}})$$
+$$\text{Cost}_{\text{Total}} = (T_{\text{in}} \times P_{\text{in}}) + (T_{\text{cache-read}} \times P_{\text{cache-read}}) + (T_{\text{cache-write}} \times P_{\text{cache-write}}) + (T_{\text{out}} \times P_{\text{out}})$$
 
 * **Prompt Caching Support:** Accurately accounts for Anthropic Prompt Caching discounts (up to 90% discount on cache hits) and OpenAI batch pricing.
 * **Reasoning & Extended Thinking Accounting:** Explicitly meters reasoning tokens (Claude 3.7 Sonnet thinking, DeepSeek-R1, o3-mini) as output tokens, ensuring thinking budgets are strictly captured in total transaction cost.
@@ -291,7 +291,7 @@ To guarantee zero budget overruns without incurring high-latency relational data
 #### 2. Atomic Pre-Flight Reservation & True-Up Protocol
 Post-hoc cost deduction allows long generations (e.g., 32k-token completions or extended thinking models) to breach budgets if an engineer has only pennies remaining. To prevent overshoots:
 1. **Pre-Flight Reservation:** Prior to upstream dispatch, the gateway estimates maximum potential cost:  
-   $$\text{Cost}_{\text{Est}} = (T_{\text{in\_observed}} \times P_{\text{in}}) + (\min(T_{\text{max\_tokens}}, 2048) \times P_{\text{out}})$$
+   $$\text{Cost}_{\text{Est}} = (T_{\text{in-observed}} \times P_{\text{in}}) + (\min(T_{\text{max-tokens}}, 2048) \times P_{\text{out}})$$
    An atomic Redis Lua script checks `current_spend + Cost_Est <= monthly_quota`. If permitted, it temporarily reserves $\text{Cost}_{\text{Est}}$ in Redis.
 2. **Immediate Edge Rejection:** If the reservation exceeds the quota limit, the gateway rejects the request at the ALB/proxy boundary in `< 5ms` with HTTP 429—zero upstream Bedrock API call is initiated, incurring **$0.00 cost**.
 3. **Post-Flight True-Up:** Upon stream completion (or client abort), the exact cost $\text{Cost}_{\text{Actual}}$ is computed. The delta $(\text{Cost}_{\text{Actual}} - \text{Cost}_{\text{Est}})$ is atomically applied to the Redis counter, releasing unused reserved funds, and logged asynchronously to the Aurora transactional ledger.
@@ -327,7 +327,7 @@ Waiting until an engineer consumes 80% or 100% of their quota abruptly halts act
 #### 2. Early-Warning Triggers & Thresholds
 * **Trajectory Warning (Day 5–10):** If $\text{Spend}_{\text{Forecast}} > 120\%$ of the monthly quota, an early warning is sent to the developer via Microsoft Teams.
 * **80% Soft Warning:** When monthly consumption reaches $40.00 (on a $50.00 cap), the gateway appends an HTTP response header: `X-LLM-Quota-Remaining-USD: 10.00` and posts a Teams alert.
-* **Velocity Anomaly Detection:** If an API key sustains spend $> \$5.00/\text{hour}$ or high token velocity between 00:00 and 06:00 JST, the key is throttled to Tier 1 baseline models pending manager review.
+* **Velocity Anomaly Detection:** If an API key sustains spend **> $5.00/hour** or high token velocity between 00:00 and 06:00 JST, the key is throttled to Tier 1 baseline models pending manager review.
 
 #### 3. Graceful Degradation & Throttling Options
 When an engineer crosses 90% of their forecast or allowance:
