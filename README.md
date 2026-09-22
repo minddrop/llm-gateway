@@ -1,0 +1,106 @@
+# Enterprise Engineering LLM Gateway
+**Hardened Internal AI Proxy & Governance Platform for Enterprise Software Engineering**  
+**Target Environment:** AWS Tokyo (`ap-northeast-1`) Primary / AWS Osaka (`ap-northeast-3`) Disaster Recovery  
+**Compliance Standard:** 100% Japan Sovereign Geofence & Zero Internet Egress
+
+---
+
+## 1. Overview & Purpose
+
+The **Enterprise Engineering LLM Gateway** provides a centralized, secure, highly available, and cost-controlled internal AI proxy for software developers, data scientists, and DevOps teams across the enterprise. It enables frictionless developer ergonomics for modern AI coding tools—including IDE assistants (Cursor, VS Code, Cline, Continue.dev), terminal CLIs (Aider, Claude Code), and CI/CD pipelines—while guaranteeing that corporate source code and credentials never leak to the public internet or foreign cloud regions.
+
+### Core Architectural Pillars
+* **100% Drop-In Wire Compatibility:** Native emulation of OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) wire protocols via standard `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` redirection.
+* **Isolated VPC / Zero Internet Egress:** The core processing tier runs in fully isolated AWS subnets without NAT Gateways or Internet Gateways. All upstream traffic routes strictly through AWS PrivateLink Interface Endpoints.
+* **Absolute Japan Geo Residency:** Enforced at both the IAM task role level and AWS Organizations Service Control Policy (SCP) level. Traffic is pinned strictly to Tokyo (`ap-northeast-1`), Osaka (`ap-northeast-3`), and Japan Cross-Region (`jp.*`) inference profiles.
+* **Low-Latency Streaming Data Plane:** Unbuffered Server-Sent Events (SSE) streaming with `< 20ms` proxy overhead and `300s` connection timeouts to support extended thinking / reasoning models (`claude-3-7-sonnet`, `o3-mini`, `deepseek-r1`).
+* **FinOps Governance & Atomic Reservation:** Multi-tier budget hierarchy ($10/day, $50/mo default) enforced atomically via ElastiCache Redis Serverless Lua scripts, reconciled daily into Apache Parquet on Amazon S3 for Athena/ERP billing.
+* **Dual-Pass In-Line DLP Engine:** High-performance pre-flight prompt regex scanning and 128-character sliding-window outbound SSE chunk buffer redaction.
+
+---
+
+## 2. Documentation Architecture
+
+The repository follows a clean **3-Tier Enterprise Documentation Model**, maintaining a strict separation between functional requirements, physical cloud infrastructure design, and the rapidly evolving foundation model catalog:
+
+```
+llm-gateway/
+├── README.md                     # Central entrypoint, architectural index & quickstart
+├── REQUIREMENTS.md               # Functional, Governance & Security Operational Specification (WHAT & WHY)
+├── REQUIREMENTS_JA.md            # 日本語版運用仕様書 (Japanese Operational Specification)
+├── INFRASTRUCTURE_SPEC.md        # AWS Physical Architecture Blueprint & Infrastructure Specification (HOW)
+└── MODEL_AVAILABILITY_MATRIX.md  # Living Foundation Model & Regional Catalog (Bedrock Engines & Japan Geo)
+```
+
+### Document Navigation Map
+
+| Document | Primary Audience | Scope & Key Contents |
+| :--- | :--- | :--- |
+| **[REQUIREMENTS.md](REQUIREMENTS.md)**<br/>*(日本語: [REQUIREMENTS_JA.md](REQUIREMENTS_JA.md))* | Developers, Security Auditors, FinOps, Product Owners | • Developer personas, CLI/IDE integration workflows<br/>• Multi-tier API key governance (Tiers 1–4, JIT provisioning, Jira/Teams approvals)<br/>• Real-time token pricing formulas & atomic Redis pre-flight reservation<br/>• Dual-pass in-line DLP pattern catalog & regex rules<br/>• Relational PostgreSQL data models & ERD schemas<br/>• The 8 Golden Rules for enterprise AI gateway operations |
+| **[INFRASTRUCTURE_SPEC.md](INFRASTRUCTURE_SPEC.md)** | Cloud Engineers, AWS Solutions Architects, DevOps, SREs | • Multi-AZ VPC subnet allocation matrix (`/24`, `/20`, route tables)<br/>• PrivateLink Interface Endpoints specification (12 services, Private DNS)<br/>• Security Group & stateless NACL chaining matrices<br/>• Concrete IAM JSON policies (Task Execution, Task Role `jp.*` lock, Org SCP)<br/>• Compute sizing: ECS Fargate (4 vCPU/16GB, Uvicorn tuning, auto-scaling)<br/>• Database: Aurora Serverless v2 (2–32 ACUs), RDS Proxy, Redis Serverless<br/>• KMS CMK topology, Zero-Payload CloudWatch JSON, S3 WORM & Athena DDL<br/>• Terraform / OpenTofu multi-region module structure & DR strategy |
+| **[MODEL_AVAILABILITY_MATRIX.md](MODEL_AVAILABILITY_MATRIX.md)** | AI Engineers, Platform Leads, Model Evaluators | • Complete survey of 100+ Foundation Models on Amazon Bedrock<br/>• Bedrock Runtime vs. Bedrock Mantle execution engine separation<br/>• Verified Japan Geo compliance status (In-Region Tokyo vs. `jp.` profiles)<br/>• Foreign/Global non-compliant models requiring explicit SecOps waivers |
+
+---
+
+## 3. High-Level System Architecture
+
+```mermaid
+flowchart TD
+    subgraph CorporateClient["Corporate Client Perimeter (Intune MDM)"]
+        IDE["IDE Assistants (Cursor / VS Code / Cline)"]
+        CLI["Terminal CLI (llm-gw login / Aider)"]
+    end
+
+    subgraph AWS_Ingress["AWS Verified Access (ZTNA)"]
+        AVA["AWS Verified Access Endpoint<br/>(Validates Entra ID OIDC + Intune Posture)"]
+    end
+
+    subgraph AWS_VPC["Dedicated LLM Gateway VPC (ap-northeast-1) - Zero NAT / Zero IGW"]
+        ALB["Internal Application Load Balancer<br/>(TLS 1.3, Unbuffered SSE, 300s Timeout)"]
+        Proxy["ECS Fargate Core Proxy Tasks<br/>(LiteLLM Engine + Dual-Pass DLP Middleware)"]
+        Redis["ElastiCache Redis Serverless (Multi-AZ)<br/>(Atomic Pre-Flight Quota Reservation)"]
+        RDS_Proxy["AWS RDS Proxy<br/>(Connection Multiplexing & Fast Failover)"]
+        Aurora["Aurora PostgreSQL Serverless v2<br/>(Users, Virtual Keys, Ledgers)"]
+        VPCE["AWS PrivateLink Interface Endpoints<br/>(Bedrock, Secrets Manager, KMS, CloudWatch, Logs)"]
+    end
+
+    subgraph Upstream_Bedrock["Amazon Bedrock (Japan Sovereign Boundary)"]
+        Runtime["Bedrock Runtime (ap-northeast-1)<br/>• jp.* Cross-Region Profiles (Sonnet 4.5/4.6, Haiku 4.5)<br/>• In-Region Tokyo Models (Devstral 2, Qwen3, GPT OSS)<br/>• Vector Embeddings (Titan v2, Cohere Multilingual)"]
+        Mantle["Bedrock Mantle (ap-northeast-1)<br/>• Open Models with Server-Side Tools & Async Batches"]
+    end
+
+    subgraph Storage_Telemetry["Audit & FinOps Storage"]
+        CW["Amazon CloudWatch<br/>(Encrypted Zero-Payload Operational Logs)"]
+        S3_FinOps["S3 FinOps Bucket (Parquet)<br/>(Daily Export for Athena / ERP Invoicing)"]
+        S3_Audit["S3 Audit Bucket (WORM / Object Lock)<br/>(Encrypted Compliance Archive)"]
+    end
+
+    IDE & CLI -->|"HTTPS 443"| AVA --> ALB --> Proxy
+    Proxy <-->|"TCP 6379"| Redis
+    Proxy <-->|"TCP 5432"| RDS_Proxy <--> Aurora
+    Proxy -->|"HTTPS 443 (PrivateLink)"| VPCE
+    VPCE --> Runtime & Mantle
+    Proxy --> CW
+    Proxy -.->|"Daily Scheduled Extraction"| S3_FinOps & S3_Audit
+```
+
+---
+
+## 4. Key Performance & Reliability Metrics
+
+* **Proxy Overhead Latency:** `< 20ms (p95)` added latency beyond upstream provider inference time.
+* **Availability Target:** `99.9% Monthly Uptime` during internal engineering hours (07:00–23:00 JST).
+* **Connection Timeout:** `300 seconds` uniform idle timeout across AVA, ALB, and proxy containers to support frontier reasoning models.
+* **Disaster Recovery (Tokyo -> Osaka):**
+  * **RTO (Recovery Time Objective):** `< 15 Minutes`
+  * **RPO (Recovery Point Objective):** `< 1 Minute` (Aurora Global Database + S3 Cross-Region Replication).
+
+---
+
+## 5. Security & Compliance Standards
+
+* **Zero Internet Egress:** Verified VPC with zero internet routes (`0.0.0.0/0` destination does not exist in any route table).
+* **Cryptographic Geofencing:** AWS Organizations SCP and IAM task roles enforce that requests cannot target models outside Japanese sovereign borders.
+* **Zero Plaintext Credentials:** Upstream master keys reside in AWS Secrets Manager; developers utilize synthetic, salted SHA-256 hashed Virtual Keys.
+* **Zero-Payload Logging:** Container logs record strictly metadata and SHA-256 prompt hashes. Proprietary codebase contents and raw prompts are never written to disk.
+* **Sub-60s Offboarding:** SCIM 2.0 webhooks invalidate all virtual keys and flush Redis sessions within 60 seconds of employee deactivation in Microsoft Entra ID.
