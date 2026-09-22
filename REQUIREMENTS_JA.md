@@ -5,6 +5,9 @@
 **アイデンティティ基盤:** Microsoft Entra ID (Azure AD) + Microsoft Intune  
 **主な対象範囲:** 社内エンジニアリングワークフローおよび開発（非本番／非顧客向け）  
 **ステータス:** 承認済みアーキテクチャ設計書およびセキュリティ堅牢化標準  
+**関連ドキュメント:**
+* **AWS物理アーキテクチャ設計書:** [INFRASTRUCTURE_SPEC.md](INFRASTRUCTURE_SPEC.md)（VPC、サブネット、PrivateLinkエンドポイント、IAM、Terraformモジュール構成）
+* **モデル＆リージョン対応表:** [MODEL_AVAILABILITY_MATRIX.md](MODEL_AVAILABILITY_MATRIX.md)（Amazon Bedrockエンジン＆日本国内データレジデンシー調査）
 
 ---
 
@@ -88,6 +91,13 @@ flowchart TD
     Proxy -->|"日次集計支出"| FinOps
 ```
 
+### 2.1 コアアーキテクチャ境界およびインフラストラクチャ不変条件
+* **完全分離VPC / インターネットエグレスゼロ（Zero Egress）:** コア処理層（ECS Fargate）、データ層、およびエンドポイントENIは、NAT GatewayやInternet Gatewayを一切持たない完全に分離されたプライベートサブネット内に配置。すべてのサブネットルートテーブルは、VPCローカルCIDRおよびAmazon S3 Gatewayエンドポイントのプレフィックスリストのみを含みます。
+* **AWS PrivateLinkの完全統合:** Amazon Bedrock Runtime、Bedrock Control、Secrets Manager、CloudWatch Logs/Metrics、KMS、ECRとの通信は、プライベートDNSを有効化したAWS PrivateLink VPCインターフェイスエンドポイントを経由して行われます。
+* **AWS RDS Proxyによる接続多重化:** ECS Fargateタスクは、3つのアベイラビリティゾーン（`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`）にデプロイされたAWS RDS Proxyを経由してのみAurora PostgreSQL Serverless v2に接続。コンテナの急激なスケールアウト時におけるDB接続枯渇を完全に排除し、3.2秒未満の高速フェイルオーバーを実現します。
+* **分散クォータ状態ストア（ElastiCache Redis Serverless）:** `noeviction`（退避なし）メモリポリシーを強制したマルチAZ構成で動作し、事前引当枠（Reservation）やスライディングウィンドウのトークンバケットが不意にメモリから消失するのを防止します。
+* **物理実装設計書:** 具体的なサブネットCIDR割り当て、セキュリティグループ通信マトリクス、IAM JSONポリシー、Terraformモジュール構成については、[INFRASTRUCTURE_SPEC.md](INFRASTRUCTURE_SPEC.md) を参照してください。
+
 ---
 
 ## 3. 運用信頼性とDay-2運用（本番対応力）
@@ -131,7 +141,10 @@ flowchart TD
 * **グレースフルデグラデーション（Graceful Degradation）:** 国内のすべての候補エンドポイントが失敗した場合、ゲートウェイはプロバイダーのヘルス状態と推奨代替モデルの詳細を記載した、構造化された開発者向けフレンドリーなエラーメッセージを返却します。
 
 ### 3.4 同時実行性、コネクションプーリング、およびロードシェディング
-* **ECS Fargateタスクのサイジング:** 基本構成として2つのアベイラビリティゾーン（`ap-northeast-1a`, `ap-northeast-1c`）にまたがる最小2タスクを実行し、平均目標接続数（コンテナあたり250アクティブ接続超）に基づいて最大10タスクまでオートスケーリング。
+* **ECS Fargateタスクのサイジング:** 基本構成として3つのアベイラビリティゾーン（`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`）にまたがる最小4タスクを実行し、平均目標接続数（コンテナあたり250アクティブ接続超）およびメモリ使用率（75%超）に基づいて最大24タスクまでオートスケーリング。
+* **データベース＆キャッシュの接続多重化:**
+  * **AWS RDS Proxy:** 数千の受信コンテナクエリを最大120の固定PostgreSQLバックエンド接続に多重化（Multiplexing）し、Aurora Serverless v2での接続枯渇を完全に防止。
+  * **ElastiCache Redis Serverless:** ワーカープロセスあたり最大250接続（`max_connections=250`）のコネクションプールと永続的Keep-Aliveを維持。
 * **HTTPクライアントのコネクションプーリング:** プロキシエンジンは、Bedrock Runtime、Bedrock Mantle、および外部APIへの永続的なHTTP/2 keep-alive接続プールを維持し、プロンプトチャンクごとのTLSハンドシェイクオーバーヘッドを排除します。
 * **ロードシェディング（負荷制限）:** コンテナメモリが85%に達するかスレッドプールが飽和した場合、ゲートウェイは対話型の開発者IDEタイピングストリームを維持しつつ、非対話型トラフィック（バックグラウンドCI/CDバッチテストジョブなど）を `HTTP 429 Retry-After: 30` ヘッダーを返して一時的に遮断します。
 
