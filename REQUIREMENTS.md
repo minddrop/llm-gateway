@@ -5,6 +5,9 @@
 **Identity Infrastructure:** Microsoft Entra ID (Azure AD) + Microsoft Intune  
 **Primary Scope:** Internal Engineering Workflows & Development (Non-Production / Non-Customer-Facing)  
 **Status:** Approved Architectural Blueprint & Security Hardening Standard  
+**Companion Documents:**
+* **AWS Physical Architecture Blueprint:** [INFRASTRUCTURE_SPEC.md](INFRASTRUCTURE_SPEC.md) (VPC, Subnets, PrivateLink Endpoints, IAM & Terraform Modules)
+* **Model & Geo Availability Matrix:** [MODEL_AVAILABILITY_MATRIX.md](MODEL_AVAILABILITY_MATRIX.md) (Amazon Bedrock Engines & Japan Residency Survey)
 
 ---
 
@@ -88,6 +91,13 @@ flowchart TD
     Proxy -->|"Daily Aggregated Spend"| FinOps
 ```
 
+### 2.1 Core Architectural Boundaries & Infrastructure Invariants
+* **Isolated VPC / Zero Internet Egress:** The core processing tier (ECS Fargate), state tier, and endpoint ENIs reside in private, fully isolated subnets with zero NAT Gateways and zero Internet Gateways. All subnet route tables contain strictly local VPC CIDRs and the Amazon S3 Gateway Endpoint prefix list.
+* **AWS PrivateLink Integration:** Communication with Amazon Bedrock Runtime, Bedrock Control, Secrets Manager, CloudWatch Logs/Metrics, KMS, and ECR routes strictly over AWS PrivateLink VPC Interface Endpoints with Private DNS enabled.
+* **Database Multiplexing via AWS RDS Proxy:** ECS Fargate tasks connect to Aurora PostgreSQL Serverless v2 exclusively via AWS RDS Proxy deployed across 3 Availability Zones (`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`). This eliminates connection exhaustion during rapid container scale-outs and ensures sub-3.2-second database failover.
+* **Distributed Quota State (ElastiCache Redis Serverless):** Operates Multi-AZ with an enforced `noeviction` memory policy to guarantee that financial reservations and sliding-window token buckets are never evicted.
+* **Physical Implementation Blueprint:** For concrete subnet CIDR allocations, security group rule matrices, IAM JSON policies, and Terraform modules, refer directly to [INFRASTRUCTURE_SPEC.md](INFRASTRUCTURE_SPEC.md).
+
 ---
 
 ## 3. Operational Reliability & Day-2 Operations (Production Readiness)
@@ -131,7 +141,10 @@ flowchart TD
 * **Graceful Degradation:** If all candidate in-country endpoints fail, the gateway returns a structured developer-friendly error message detailing provider health and recommended alternative models.
 
 ### 3.4 Concurrency, Connection Pooling & Load Shedding
-* **ECS Fargate Task Sizing:** Base deployment runs minimum 2 tasks across 2 Availability Zones (`ap-northeast-1a`, `ap-northeast-1c`), auto-scaling up to 10 tasks based on average target connection count (> 250 active connections per container).
+* **ECS Fargate Task Sizing:** Base deployment runs minimum 4 tasks across 3 Availability Zones (`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`), auto-scaling up to 24 tasks based on average target connection count (> 250 active connections per container) and memory utilization (> 75%).
+* **Database & Cache Connection Multiplexing:**
+  * **AWS RDS Proxy:** Multiplexes thousands of incoming container queries down to 120 pinned PostgreSQL backend connections, ensuring zero connection exhaustion on Aurora Serverless v2.
+  * **ElastiCache Redis Serverless:** Maintained via connection pools (`max_connections=250` per worker process) with persistent keep-alive.
 * **HTTP Client Connection Pooling:** The proxy engine maintains persistent HTTP/2 keep-alive connection pools to Bedrock Runtime, Bedrock Mantle, and external APIs, eliminating TLS handshake overhead on every prompt chunk.
 * **Load Shedding:** If container memory reaches 85% or thread pools saturate, the gateway sheds non-interactive traffic (e.g., background CI/CD batch test jobs) with an `HTTP 429 Retry-After: 30` header while preserving interactive developer IDE typing streams.
 
