@@ -60,7 +60,7 @@ flowchart TD
 
     subgraph AWS_VPC["Dedicated LLM Gateway VPC (ap-northeast-1) - Zero NAT / Zero IGW"]
         ALB["Internal Application Load Balancer<br/>(TLS 1.3, Unbuffered SSE, 300s Timeout)"]
-        Proxy["ECS Fargate Core Proxy Tasks (Graviton ARM64)<br/>(LiteLLM Engine + Dual-Pass DLP Middleware)"]
+        Proxy["ECS Fargate Core Proxy Tasks (Graviton ARM64)<br/>• Tier 1 In-Memory Regex DLP (HTTP 422 Block)<br/>• Tier 3 SSE 128-char Outbound Buffer"]
         Redis["ElastiCache Serverless (Multi-AZ)<br/>(Atomic Pre-Flight Quota Reservation)"]
         RDS_Proxy["AWS RDS Proxy<br/>(Connection Multiplexing & Fast Failover)"]
         Aurora["Aurora PostgreSQL Serverless v2<br/>(Users, Virtual Keys, Ledgers)"]
@@ -68,6 +68,7 @@ flowchart TD
     end
 
     subgraph Upstream_Bedrock["Amazon Bedrock (Japan Sovereign Boundary)"]
+        Guardrails["Tier 2: Amazon Bedrock Guardrails<br/>• Prompt Attack HIGH Filter<br/>• Denied Topics & Exploit Shield<br/>• Japan My Number & PII Redaction"]
         Runtime["Bedrock Runtime (ap-northeast-1)<br/>• jp.* Cross-Region Profiles (Sonnet 4.5/4.6, Haiku 4.5)<br/>• In-Region Tokyo Models (Devstral 2, Qwen3, GPT OSS)<br/>• Vector Embeddings (Titan v2, Cohere Multilingual)"]
         Mantle["Bedrock Mantle (ap-northeast-1)<br/>• Open Models with Server-Side Tools & Async Batches"]
     end
@@ -82,7 +83,8 @@ flowchart TD
     Proxy <-->|"TCP 6379"| Redis
     Proxy <-->|"TCP 5432"| RDS_Proxy <--> Aurora
     Proxy -->|"HTTPS 443 (PrivateLink)"| VPCE
-    VPCE --> Runtime & Mantle
+    VPCE --> Guardrails --> Runtime
+    VPCE --> Mantle
     Proxy --> CW
     Proxy -.->|"Daily Scheduled Extraction"| S3_FinOps & S3_Audit
 ```

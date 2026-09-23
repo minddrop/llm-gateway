@@ -143,7 +143,7 @@ flowchart TD
     end
 
     subgraph VPC_Isolated["Isolated Gateway VPC (10.100.0.0/16) - Zero IGW / Zero NAT"]
-        Proxy["ECS Fargate Proxy Tier (Graviton ARM64)<br/>• Read-only Root FS + /tmp tmpfs<br/>• Dual-Pass DLP Engine<br/>• Uvicorn (4 Workers)"]
+        Proxy["ECS Fargate Proxy Tier (Graviton ARM64)<br/>• Read-only Root FS + /tmp tmpfs<br/>• Tier 1 In-Memory Regex DLP (HTTP 422 Block)<br/>• Tier 3 SSE 128-char Outbound Buffer<br/>• Uvicorn (4 Workers)"]
         Redis["ElastiCache Serverless (Multi-AZ)<br/>• Atomic Lua Quota Reservation"]
         RDS_Proxy["AWS RDS Proxy (Multi-AZ)<br/>• Connection Pooling (120 Backends)"]
         Aurora[("Aurora PostgreSQL Serverless v2<br/>• Multi-AZ Multi-Tier DB")]
@@ -151,6 +151,7 @@ flowchart TD
     end
 
     subgraph UpstreamBedrock["Amazon Bedrock (Japan Sovereign Boundary)"]
+        Guardrails["Tier 2: Amazon Bedrock Guardrails<br/>• Prompt Attack HIGH Filter<br/>• Denied Topics & Exploit Shield<br/>• Japan My Number & PII Redaction"]
         BedrockRT["Bedrock Runtime (ap-northeast-1)<br/>• jp.* Cross-Region Profiles<br/>• Tokyo Foundation Models"]
         BedrockMantle["Bedrock Mantle (ap-northeast-1)<br/>• Open Models with Server-Side Tools"]
     end
@@ -161,7 +162,8 @@ flowchart TD
     Proxy <-->|"TCP 6379 (TLS 1.3)"| Redis
     Proxy <-->|"TCP 5432 (IAM Auth)"| RDS_Proxy <--> Aurora
     Proxy -->|"HTTPS 443 (PrivateLink)"| VPCE
-    VPCE --> BedrockRT & BedrockMantle
+    VPCE --> Guardrails --> BedrockRT
+    VPCE --> BedrockMantle
 ```
 
 #### 2.1 AWS Data Perimeter Strategy
