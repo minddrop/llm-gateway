@@ -252,22 +252,104 @@ s3://s3-llm-gateway-finops-ap-northeast-1/transactions/year=YYYY/month=MM/day=DD
 
 ---
 
-### 8.3 インラインDLPエンジンとマスキングカタログ
+### 8.3 ハイブリッドDLPエンジン（Edge + Bedrock Guardrails）およびマスキングカタログ
 
-* **`[FR-DLP-01]` デュアルパスDLPエンジン:** ゲートウェイは、受信時の事前スキャンと、送信SSEストリームに対する**128文字スライディングウィンドウバッファ**によるデュアルパス検査を実施しなければならない（MUST）。
-* **`[FR-DLP-02]` 完全遮断とインラインマスキング:** 秘密鍵やDB接続URI等の高エントロピー機密は**完全遮断（HTTP 422）**とし、標準APIキーや個人情報はプレースホルダーに置換しなければならない（MUST）。
+ソフトウェア開発ワークロードにおける「正規表現のみ（プロンプト攻撃・ジェイルブレイクの検知不能）」および「Guardrailsのみ（コード固有シークレットへの未対応、カスタム正規表現10件上限、100kトークンのコードベースに対する過剰なコストと遅延）」の課題を解消するため、本ゲートウェイは**ハイブリッド3層DLPパイプライン**を強制する：
 
-| シークレット/PII種別 | ルールID | 検出基準 | 防御アクション | 挿入プレースホルダー |
+```
+                    開発者IDE（Cursor / VS Code / CLI）
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 第1層: エッジ・インライン・フィルター（Fargateコンテナ内インメモリ）  │
+│ • 事前コンパイル済み Aho-Corasick + 高エントロピースキャナー (< 1.5ms) │
+│ • インフラ機密（秘密鍵・DB URI）の即時遮断（HTTP 422 Unprocessable）  │
+│ • 開発者・SaaSトークン（AWS, GitHub, Slack 等）のインラインマスク     │
+│ • AST・構文解析によるコード識別子の誤検知防止（False-Positive Shield）│
+│ • SSRFサニタイザー: クライアント指定 api_base / keys の強制除去       │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ サニタイズ済みペイロード
+                                   ▼ (AWS PrivateLink)
+┌────────────────────────────────────────────────────────────────────────┐
+│ 第2層: Amazon Bedrock Guardrails（セマンティック安全 & ガバナンス）   │
+│ • プロンプト攻撃・ジェイルブレイク防御（HIGH強度フィルター）          │
+│ • 禁止トピック防御: マルウェア生成・エクスプロイト開発コードの完全拒否 │
+│ • 規制対象PIIのマスキング（マイナンバー・クレジットカード）           │
+│ • 違反時: 内部詳細を隠蔽した RFC 7807 エラー（HTTP 400）を返却       │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+                    Amazon Bedrock 推論実行（東京 / 大阪）
+                                   │
+                                   ▼ SSEストリーミングトークン
+┌────────────────────────────────────────────────────────────────────────┐
+│ ポストフライト: 送信ストリーム変換 & リダクター                        │
+│ • SSEチャンク境界を跨ぐ128文字スライディングウィンドウバッファ         │
+│ • モデルがハルシネーションした機密情報や反射トークンの遮断             │
+│ • Markdown流出防御: 外部画像タグ（`![...]`）の自動除去                 │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ クリーンなトークン
+                                   ▼
+                    開発者IDE（Cursor / VS Code）へ配信
+                                   │
+                                   ▼（非同期）
+┌────────────────────────────────────────────────────────────────────────┐
+│ 第3層: 非同期SecOps監査 & ディスカバリー（CloudWatch / S3）            │
+│ • SHA-256プロンプトハッシュを含むメタデータロギング                    │
+│ • CloudWatch Metric Filter: `DlpViolationCount` アラーム               │
+│ • 暗号化監査アーカイブの自動日次スキャン                               │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 詳細DLP要件
+
+* **`[FR-DLP-01]` ハイブリッド多層DLP強制:** ゲートウェイは階層型防御モデルを強制しなければならない（MUST）：
+  1. *第1層（エッジ・インライン・フィルター）:* ECSコンテナ内のインメモリで着信ペイロードの100%を評価し（< 1.5ms）、決定論的シークレット、高エントロピートークン、ルーティング上書きを捕捉する。
+  2. *第2層（Amazon Bedrock Guardrails）:* Bedrock Runtimeでのモデル呼び出し時に、セマンティックな安全性、プロンプト攻撃/ジェイルブレイク防御、および規制対象PIIの秘匿化を強制する。
+  3. *第3層（ポストフライトSSEバッファ）:* 出力ストリーミングチャンクを128文字リングバッファ経由で継続評価し、クライアントIDEに配信する。
+
+* **`[FR-DLP-02]` インフラ機密の完全遮断（Hard-Blocking）ポリシー:** 秘密暗号鍵またはパスワードを含むデータベース接続URIを含むペイロードは、コンテナから外部へ送信される前に**即時遮断（`HTTP 422 Unprocessable Entity`）**されなければならない（MUST）。秘密鍵の部分文字列残存による鍵再構築攻撃を防止するため、秘密鍵のマスキングは禁止される：
+  * 秘密暗号鍵 (`DLP-CRY-KEY-001`): `-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----` $\rightarrow$ **HTTP 422 遮断**。
+  * データベース接続URI (`DLP-DB-URI-001`): `(?i)(?:postgres|mysql|mongodb(?:\+srv)?|redis):\/\/[^:\s]+:([^@\s]+)@` $\rightarrow$ **HTTP 422 遮断**。
+
+* **`[FR-DLP-03]` 開発者 & SaaSトークンマスキングカタログ:** 高エントロピーなAPIトークンは、インラインで標準プレースホルダーへ置換されなければならない（MUST）：
+
+| シークレット種別 | ルールID | 検出基準 | 防御アクション | 挿入プレースホルダー |
 | :--- | :--- | :--- | :--- | :--- |
-| **AWSアクセスキーID** | `DLP-AWS-KEY-001` | `\b((?:AKIA\|ABIA\|ACCA\|ASIA)[0-9A-Z]{16})\b` | マスキング | `[REDACTED_AWS_ACCESS_KEY]` |
-| **AWSシークレットキー** | `DLP-AWS-SEC-002` | `(?i)aws_secret_access_key\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?` | マスキング | `[REDACTED_AWS_SECRET_KEY]` |
-| **GitHub PAT** | `DLP-GH-PAT-001` | `\b(ghp_[0-9a-zA-Z]{36})\b` | マスキング | `[REDACTED_GITHUB_PAT]` |
-| **秘密暗号鍵** | `DLP-CRY-KEY-001` | `-----BEGIN (?:RSA \|EC \|DSA \|OPENSSH \|PGP )?PRIVATE KEY-----` | **完全遮断 (HTTP 422)** | なし（リクエスト拒否） |
-| **データベース接続URI** | `DLP-DB-URI-001` | `(?i)(?:postgres\|mysql\|mongodb(?:\+srv)?\|redis):\/\/[^:\s]+:([^@\s]+)@` | **完全遮断 (HTTP 422)** | なし（リクエスト拒否） |
-| **日本の個人番号 (マイナンバー)** | `DLP-PII-MYNUM-001`| 12桁マイナンバー + モジュラス11チェックディジット | マスキング | `[REDACTED_JAPAN_MY_NUMBER]` |
+| **AWSアクセスキーID** | `DLP-AWS-KEY-001` | 正規表現: `\b((?:AKIA\|ABIA\|ACCA\|ASIA)[0-9A-Z]{16})\b` | マスキング | `[REDACTED_AWS_ACCESS_KEY]` |
+| **AWSシークレットキー** | `DLP-AWS-SEC-002` | 正規表現: `(?i)aws_secret_access_key\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?` | マスキング | `[REDACTED_AWS_SECRET_KEY]` |
+| **GitHubクラシックPAT** | `DLP-GH-PAT-001` | 正規表現: `\b(ghp_[0-9a-zA-Z]{36})\b` | マスキング | `[REDACTED_GITHUB_PAT]` |
+| **GitHub Fine-Grained PAT**| `DLP-GH-PAT-002` | 正規表現: `\b(github_pat_[0-9a-zA-Z_]{82})\b` | マスキング | `[REDACTED_GITHUB_FINE_GRAINED_PAT]` |
+| **GitLabパーソナルトークン** | `DLP-GL-PAT-001` | 正規表現: `\b(glpat-[0-9a-zA-Z\-]{20})\b` | マスキング | `[REDACTED_GITLAB_PAT]` |
+| **Slackボット / ユーザートークン** | `DLP-SLK-TOK-001` | 正規表現: `\b(xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,32})\b` | マスキング | `[REDACTED_SLACK_TOKEN]` |
+| **JSON Web Token (JWT)** | `DLP-JWT-001` | 正規表現: `\beyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]*\b` | マスキング | `[REDACTED_JWT_TOKEN]` |
 
-* **`[FR-DLP-03]` SSRFおよびパラメータ除去:** クライアントからのルーティング上書きパラメータ（`api_base`、`base_url`、`api_key` 等）を無条件で除去しなければならない（MUST）。
-* **`[FR-DLP-04]` 対エージェント情報流出防止:** 出力ストリーム内の外部Markdown画像リンクを除去し、画像レンダリングを通じた情報漏洩を遮断しなければならない（MUST）。
+* **`[FR-DLP-04]` 規制対象 & 日本国内主権PIIの秘匿化:**
+  * **個人番号（マイナンバー - `DLP-PII-MYNUM-001`）:** 公式のモジュラス11チェックディジットアルゴリズムにより検証された12桁の番号 $\rightarrow$ `[REDACTED_JAPAN_MY_NUMBER]` に置換。
+  * **クレジットカード番号（`DLP-PII-CC-001`）:** Luhnアルゴリズムにより検証された13〜19桁のカード番号 $\rightarrow$ `[REDACTED_CREDIT_CARD]` に置換。
+
+* **`[FR-DLP-05]` Amazon Bedrock Guardrails 統合:**
+  * Amazon Bedrock Runtime を対象とする開発者の対話型プロンプトはすべて、アップストリーム呼び出し時にアクティブな Guardrail 識別子とバージョン（`guardrailIdentifier` および `guardrailVersion`）を渡さなければならない（MUST）。
+  * **プロンプト攻撃防御:** Guardrail はプロンプト攻撃に対して **HIGH** 強度のフィルタリングを強制し、社内システム指示の上書きや敵対的ジェイルブレイクを阻止しなければならない（MUST）。
+  * **禁止トピック:** マルウェア、リモートエクスプロイト、認証情報収奪ツールの生成要求を拒絶するトピックポリシーを強制しなければならない（MUST）。
+  * **介入レスポンス:** Bedrock Guardrail が呼び出しをブロックした場合、ゲートウェイは内部セキュリティルールの詳細を露見させることなく、RFC 7807 形式のエラー（`HTTP 400 Bad Request`）を返却しなければならない（MUST）：
+
+```json
+{
+  "type": "https://llm-gateway.internal.corp/errors/guardrail-intervention",
+  "title": "Amazon Bedrock Guardrail Intervention",
+  "status": 400,
+  "detail": "The request violated corporate AI safety policies (Prompt Attack or Denied Topic).",
+  "instance": "/v1/chat/completions/req_01J7K8M9",
+  "action": "GUARDRAIL_INTERVENED"
+}
+```
+
+* **`[FR-DLP-06]` ソースコード誤検知防止（False-Positive Protection）:** 汎用的なPIIフィルター（氏名、住所等）をプログラミング言語の構文へ無差別に適用してはならない（SHALL NOT）。DLPエンジンは構文認識ヒューリスティック（ASTコメントスコープ限定や変数名許可リスト等）を適用し、コード識別子（`user_name = "test"`, `customer_id` 等）の破損を絶対に防止しなければならない（MUST）。
+* **`[FR-DLP-07]` 128文字送信SSEスライディングウィンドウバッファ:** 分割されたSSEチャンク境界を跨ぐ機密漏洩を防ぐため、送信ストリーミング変換層はクライアントIDEへチャンクを出力する前に128文字のリングバッファを評価しなければならない（オーバーヘッド < 1.0ms）。
+* **`[FR-DLP-08]` 対エージェント情報流出防止:**
+  * クライアント指定のルーティング上書きパラメータ（`api_base`、`base_url`、`api_key`、`custom_llm_provider`、`mock_response`）を無条件で除去しなければならない（MUST）。
+  * 送信ストリーム変換層は、間接プロンプトインジェクションによるファイル漏洩を防ぐため、社外ドメインを指す外部Markdown画像リンク（`![...](http...)`）を検出し除去しなければならない（MUST）。
 
 ---
 
@@ -397,7 +479,7 @@ erDiagram
 * **ルール 2: デュアルエンドポイントルーティング分離:** 主力コーディングアシスタント、`jp.` プロファイル、埋め込みは `bedrock-runtime.ap-northeast-1` に集約。サーバー側ツールや非同期バッチを要するリージョン内オープンモデルは `bedrock-mantle.ap-northeast-1.api.aws` へルーティング。
 * **ルール 3: 推論モデル向け300秒タイムアウトおよびバッファなしSSE:** 推論モデルの長時間思考による切断を防ぐため300秒アイドルタイムアウトを強制し、リバースプロキシのバッファリングを無効化。
 * **ルール 4: 「メタデータのみ」ロギングのデフォルト化:** メタデータとSHA-256プロンプトハッシュのみを記録し、生のコードやプロンプトを決してログファイルに出力しない。
-* **ルール 5: エッジでのインラインDLPおよびシークレットマスキング:** ペイロードがVPC境界を出る前にAWSキーや顧客PIIをマスキングし、秘密鍵は即時遮断（HTTP 422）。
+* **ルール 5: エッジでのインラインDLPとBedrock Guardrailsによるハイブリッド防御:** コンテナ内インメモリ正規表現（<1.5ms）で開発者トークンをマスキングし秘密鍵は即時遮断（HTTP 422）。さらにBedrock Guardrailsでプロンプト攻撃・ジェイルブレイクと禁止トピックをセマンティックに防御。
 * **ルール 6: 静的ドットファイルキーに勝るエフェメラルCLIトークン:** `llm-gw login` による一時トークン（8〜12時間）をOSセキュアキーチェーンに保存。
 * **ルール 7: 不正利用・副業対策およびネットワークエンクロージャー:** `X-Git-Remote` 監査により個人リポジトリを遮断し、時間外の持続的バースト消費を自動検知。
 * **ルール 8: 日次ParquetエクスポートおよびERP請求によるFinOpsの自動化:** 日次トランザクション元帳をS3 Parquetへ自動出力し、Athena経由で集計して月次ERP社内振替を完全自動化。
@@ -411,7 +493,7 @@ erDiagram
 | `[FR-INT-01..03]` | PKCE付きOIDC SSO、CLI RFC 8628 デバイスフロー、ワークロードID | [INFRASTRUCTURE_SPEC.md §2.5](INFRASTRUCTURE_SPEC.md) | **検証済み** |
 | `[FR-KEY-01..06]` | 仮想キーSHA-256保存、Tiers 1-4、JIT発行、Teams Adaptive Cards | [INFRASTRUCTURE_SPEC.md §1](INFRASTRUCTURE_SPEC.md) | **検証済み** |
 | `[FR-FIN-01..08]` | リアルタイム価格計算、アトミックLua事前予約、S3 Parquet、Athena | [INFRASTRUCTURE_SPEC.md §5.2](INFRASTRUCTURE_SPEC.md) | **検証済み** |
-| `[FR-DLP-01..05]` | インラインDLPパターンカタログ、128文字SSEバッファ、SSRFフィルタ | [INFRASTRUCTURE_SPEC.md §4.1](INFRASTRUCTURE_SPEC.md) | **検証済み** |
+| `[FR-DLP-01..08]` | ハイブリッド3層DLP、Bedrock Guardrails、インメモリ正規表現、SSEバッファ | [INFRASTRUCTURE_SPEC.md §2.11](INFRASTRUCTURE_SPEC.md) | **検証済み** |
 | `[FR-AUD-01..04]` | ゼロペイロードログ、CloudWatch KMS CMK、Gitリモート検証 | [INFRASTRUCTURE_SPEC.md §2.8](INFRASTRUCTURE_SPEC.md) | **検証済み** |
 | `[NFR-PERF-01..03]`| 20ms未満のプロキシオーバーヘッド、300秒タイムアウト、バッファなしSSE | [INFRASTRUCTURE_SPEC.md §3.2](INFRASTRUCTURE_SPEC.md) | **検証済み** |
 | `[NFR-AVAIL-01]` | コア時間帯99.9%月間稼働率、3-AZマルチAZ分散配置 | [INFRASTRUCTURE_SPEC.md §3.1](INFRASTRUCTURE_SPEC.md) | **検証済み** |
