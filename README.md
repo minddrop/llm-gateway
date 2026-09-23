@@ -53,13 +53,15 @@ flowchart TD
         CLI["Terminal CLI (llm-gw login / Aider)"]
     end
 
-    subgraph AWS_Ingress["AWS Verified Access (ZTNA) & Edge Security"]
+    subgraph ZTNA_Ingress["Zero Trust Network Access (ZTNA)"]
         AVA["AWS Verified Access Endpoint<br/>(Validates Entra ID OIDC + Intune Posture via Cedar)"]
-        WAF["AWS WAF v2 WebACL<br/>(AVA Context Header Validation & Rate Limiting)"]
     end
 
     subgraph AWS_VPC["Dedicated LLM Gateway VPC (ap-northeast-1) - Zero NAT / Zero IGW"]
-        ALB["Internal Application Load Balancer<br/>(TLS 1.3, Unbuffered SSE, 300s Timeout)"]
+        subgraph VPC_Ingress["Ingress Subnets (10.100.0.0/24)"]
+            ALB["Internal Application Load Balancer<br/>(TLS 1.3, Unbuffered SSE, 300s Timeout)"]
+            WAF["AWS WAF v2 WebACL (Attached to ALB)<br/>(AVA Context Header Validation & Rate Limiting)"]
+        end
         Proxy["ECS Fargate Core Proxy Tasks (Graviton ARM64)<br/>• Tier 1 In-Memory Regex DLP (HTTP 422 Block)<br/>• Tier 3 SSE 128-char Outbound Buffer"]
         Redis["ElastiCache Serverless (Multi-AZ)<br/>(Atomic Pre-Flight Quota Reservation)"]
         RDS_Proxy["AWS RDS Proxy<br/>(Connection Multiplexing & Fast Failover)"]
@@ -79,7 +81,10 @@ flowchart TD
         S3_Audit["S3 Audit Bucket (WORM / Object Lock)<br/>(Encrypted Compliance Archive)"]
     end
 
-    IDE & CLI -->|"HTTPS 443"| AVA --> WAF --> ALB --> Proxy
+    IDE & CLI -->|"HTTPS 443"| AVA
+    AVA -->|"Signed x-amzn-ava-user-context"| ALB
+    WAF -.->|"Attached to"| ALB
+    ALB -->|"HTTP 8000"| Proxy
     Proxy <-->|"TCP 6379"| Redis
     Proxy <-->|"TCP 5432"| RDS_Proxy <--> Aurora
     Proxy -->|"HTTPS 443 (PrivateLink)"| VPCE

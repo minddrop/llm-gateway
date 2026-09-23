@@ -136,28 +136,40 @@ flowchart TD
         Client["Developer Client (Cursor / VS Code / Aider)"]
     end
 
-    subgraph AWS_Ingress["AWS Verified Access & Edge Security"]
-        AVA["AWS Verified Access (AVA)<br/>• Cedar Policy Evaluation<br/>• Entra ID OIDC + Intune Posture"]
-        WAF["AWS WAF v2 WebACL<br/>• AVA Context Header Validation<br/>• Rate-Based DDoS Shield"]
-        ALB["Internal Application Load Balancer<br/>• TLS 1.3 Termination (Port 443)<br/>• Unbuffered SSE, 300s Timeout"]
-    end
+    subgraph AWS_Region["AWS Tokyo Region (ap-northeast-1)"]
+        AVA["AWS Verified Access (AVA - ZTNA Ingress)<br/>• Cedar Policy Engine<br/>• Validates Entra ID OIDC + Intune Posture"]
 
-    subgraph VPC_Isolated["Isolated Gateway VPC (10.100.0.0/16) - Zero IGW / Zero NAT"]
-        Proxy["ECS Fargate Proxy Tier (Graviton ARM64)<br/>• Read-only Root FS + /tmp tmpfs<br/>• Tier 1 In-Memory Regex DLP (HTTP 422 Block)<br/>• Tier 3 SSE 128-char Outbound Buffer<br/>• Uvicorn (4 Workers)"]
-        Redis["ElastiCache Serverless (Multi-AZ)<br/>• Atomic Lua Quota Reservation"]
-        RDS_Proxy["AWS RDS Proxy (Multi-AZ)<br/>• Connection Pooling (120 Backends)"]
-        Aurora[("Aurora PostgreSQL Serverless v2<br/>• Multi-AZ Multi-Tier DB")]
-        VPCE["AWS PrivateLink Interface Endpoints<br/>• Bedrock, Secrets Mgr, KMS, Logs, ECR"]
-    end
+        subgraph VPC_Isolated["Dedicated Isolated VPC (10.100.0.0/16) - Zero IGW / Zero NAT"]
+            subgraph Subnet_Ingress["Ingress Subnets (10.100.0.0/24 - Multi-AZ 1a, 1c, 1d)"]
+                ALB["Internal Application Load Balancer<br/>• TLS 1.3 Termination (Port 443)<br/>• Unbuffered SSE, 300s Timeout"]
+                WAF["AWS WAF v2 WebACL (Attached to ALB)<br/>• AVA Context Header Validation<br/>• Rate-Based DDoS Shield"]
+            end
 
-    subgraph UpstreamBedrock["Amazon Bedrock (Japan Sovereign Boundary)"]
-        Guardrails["Tier 2: Amazon Bedrock Guardrails<br/>• Prompt Attack HIGH Filter<br/>• Denied Topics & Exploit Shield<br/>• Japan My Number & PII Redaction"]
-        BedrockRT["Bedrock Runtime (ap-northeast-1)<br/>• jp.* Cross-Region Profiles<br/>• Tokyo Foundation Models"]
-        BedrockMantle["Bedrock Mantle (ap-northeast-1)<br/>• Open Models with Server-Side Tools"]
+            subgraph Subnet_App["App Subnets (10.100.16.0/20 - Multi-AZ 1a, 1c, 1d)"]
+                Proxy["ECS Fargate Proxy Tier (Graviton ARM64)<br/>• Read-only Root FS + /tmp tmpfs<br/>• Tier 1 In-Memory Regex DLP (HTTP 422 Block)<br/>• Tier 3 SSE 128-char Outbound Buffer<br/>• Uvicorn (4 Workers)"]
+            end
+
+            subgraph Subnet_Data["Data Subnets (10.100.64.0/24 - Multi-AZ 1a, 1c, 1d)"]
+                Redis["ElastiCache Serverless (Multi-AZ)<br/>• Atomic Lua Quota Reservation"]
+                RDS_Proxy["AWS RDS Proxy (Multi-AZ)<br/>• Connection Pooling (120 Backends)"]
+                Aurora[("Aurora PostgreSQL Serverless v2<br/>• Multi-AZ Multi-Tier DB")]
+            end
+
+            subgraph Subnet_VPCE["Endpoint Subnets (10.100.80.0/24 - Multi-AZ 1a, 1c, 1d)"]
+                VPCE["AWS PrivateLink Interface Endpoints<br/>• Bedrock, Secrets Mgr, KMS, Logs, ECR"]
+            end
+        end
+
+        subgraph UpstreamBedrock["Amazon Bedrock (Japan Sovereign Boundary)"]
+            Guardrails["Tier 2: Amazon Bedrock Guardrails<br/>• Prompt Attack HIGH Filter<br/>• Denied Topics & Exploit Shield<br/>• Japan My Number & PII Redaction"]
+            BedrockRT["Bedrock Runtime (ap-northeast-1)<br/>• jp.* Cross-Region Profiles<br/>• Tokyo Foundation Models"]
+            BedrockMantle["Bedrock Mantle (ap-northeast-1)<br/>• Open Models with Server-Side Tools"]
+        end
     end
 
     Client -->|"HTTPS 443 (Device Cert)"| AVA
-    AVA -->|"Signed x-amzn-ava-user-context"| WAF --> ALB
+    AVA -->|"Signed x-amzn-ava-user-context"| ALB
+    WAF -.->|"Attached to"| ALB
     ALB -->|"HTTP 8000 (Keep-Alive)"| Proxy
     Proxy <-->|"TCP 6379 (TLS 1.3)"| Redis
     Proxy <-->|"TCP 5432 (IAM Auth)"| RDS_Proxy <--> Aurora
