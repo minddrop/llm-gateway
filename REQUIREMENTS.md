@@ -289,14 +289,67 @@ s3://s3-llm-gateway-finops-ap-northeast-1/transactions/year=YYYY/month=MM/day=DD
 
 ---
 
-### 8.3 In-Line DLP Engine & Redaction Pattern Catalog
+### 8.3 Hybrid Multi-Tier DLP Engine Architecture
 
-* **`[FR-DLP-01]` Dual-Pass DLP Engine:** The gateway MUST execute a dual-pass inspection:
-  1. *Pre-flight Inbound Scan:* Recursively scans incoming prompts, system instructions, and tool call outputs.
-  2. *Post-flight Outbound Scan:* Inspects outbound SSE chunks across a **128-character sliding-window buffer** to intercept credentials split across chunk boundaries.
-* **`[FR-DLP-02]` Hard Blocking vs. Redaction:** High-entropy credentials (private keys, DB URIs) MUST be **hard-blocked (`HTTP 422 Unprocessable Entity`)**. Standard API tokens and PII MUST be masked with placeholders.
+To resolve the trade-offs between speed, cost, and semantic safety, the gateway implements a **Hybrid Multi-Tier Data Loss Prevention (DLP) Pipeline** combining high-performance in-memory edge filtering with **Amazon Bedrock Guardrails**:
 
-| Secret / PII Category | Rule ID | Match Criteria | Defensive Action | Placeholder Injected |
+```
+Incoming Developer Payload (Prompts / Code / Diffs / Tool Outputs)
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ TIER 1: In-Line Edge Hardening (FastAPI / Hyperscan Middleware)        │
+│ • Runs inside ECS Fargate container (< 1.5ms latency, $0.00 cost)      │
+│ • High-Entropy Secret Scanner: Private Keys, DB URIs, AWS/GitHub Keys   │
+│ • Action: Hard Block (HTTP 422) on Private Keys / In-Line Redaction    │
+│ • SSRF Filter: Strips client-supplied routing parameters               │
+│ • Git Remote Origin Audit (`X-Git-Remote`)                             │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ Cleaned Payload
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ TIER 2: Amazon Bedrock Guardrails (Managed Semantic & Safety Engine)   │
+│ • Integrated natively into Bedrock Runtime via `guardrailIdentifier`   │
+│ • Prompt Attack & Jailbreak Filters (Strength: HIGH)                   │
+│ • Sensitive PII Masking: Credit Cards, SSN, Japan My Number            │
+│ • Denied Topics: Prohibits generation of exploits/malware              │
+│ • Contextual Grounding (optional for RAG tasks)                        │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ Upstream Generation (Streaming SSE)
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ POST-FLIGHT: Outbound Stream Transformer & Redactor                    │
+│ • 128-character sliding-window buffer across SSE chunk boundaries      │
+│ • Intercepts hallucinated secrets or reflected credentials             │
+│ • Markdown Exfiltration Blocker: Strips external image tags (`![...]`) │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │ Cleaned Tokens
+                                   ▼
+                   Delivered to Developer IDE (Cursor / VS Code)
+                                   │
+                                   ▼ (Asynchronous)
+┌────────────────────────────────────────────────────────────────────────┐
+│ TIER 3: Asynchronous SecOps Audit & Discovery (CloudWatch / S3)        │
+│ • Metadata logging with SHA-256 prompt hash                            │
+│ • CloudWatch Metric Filter: `DlpViolationCount` alarms                 │
+│ • Automated daily scan of encrypted audit archive                      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Detailed DLP Requirements
+
+* **`[FR-DLP-01]` Hybrid Multi-Tier DLP Enforcement:** The gateway MUST enforce a tiered defense model:
+  1. *Tier 1 (Edge In-Line Filter):* Evaluates 100% of incoming payloads in-memory within the ECS container (< 1.5ms), catching deterministic secrets, high-entropy tokens, and routing overrides.
+  2. *Tier 2 (Amazon Bedrock Guardrails):* Enforces semantic safety, prompt attack / jailbreak mitigation, and regulatory PII redaction during model invocation on Bedrock Runtime.
+  3. *Tier 3 (Post-Flight SSE Buffer):* Continuously evaluates outbound streaming chunks across a 128-character ring buffer before yielding tokens to client IDEs.
+
+* **`[FR-DLP-02]` Infrastructure Secrets Hard-Blocking Policy:** Payloads containing private cryptographic keys or database connection strings with embedded passwords MUST be **hard-blocked (`HTTP 422 Unprocessable Entity`)** before the payload leaves the container. Masking is prohibited for private keys because partial string retention can enable partial-key reconstruction attacks:
+  * Private Keys (`DLP-CRY-KEY-001`): `-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----` $\rightarrow$ **HTTP 422 Block**.
+  * Database URIs (`DLP-DB-URI-001`): `(?i)(?:postgres|mysql|mongodb(?:\+srv)?|redis):\/\/[^:\s]+:([^@\s]+)@` $\rightarrow$ **HTTP 422 Block**.
+
+* **`[FR-DLP-03]` Developer & SaaS Token Masking Catalog:** High-entropy API tokens MUST be masked in-line with standard placeholders:
+
+| Secret Category | Rule ID | Match Criteria | Defensive Action | Injected Placeholder |
 | :--- | :--- | :--- | :--- | :--- |
 | **AWS Access Key ID** | `DLP-AWS-KEY-001` | Regex: `\b((?:AKIA\|ABIA\|ACCA\|ASIA)[0-9A-Z]{16})\b` | Redact | `[REDACTED_AWS_ACCESS_KEY]` |
 | **AWS Secret Access Key** | `DLP-AWS-SEC-002` | Regex: `(?i)aws_secret_access_key\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?` | Redact | `[REDACTED_AWS_SECRET_KEY]` |
@@ -304,14 +357,34 @@ s3://s3-llm-gateway-finops-ap-northeast-1/transactions/year=YYYY/month=MM/day=DD
 | **GitHub Fine-Grained PAT**| `DLP-GH-PAT-002` | Regex: `\b(github_pat_[0-9a-zA-Z_]{82})\b` | Redact | `[REDACTED_GITHUB_FINE_GRAINED_PAT]` |
 | **GitLab Personal Token** | `DLP-GL-PAT-001` | Regex: `\b(glpat-[0-9a-zA-Z\-]{20})\b` | Redact | `[REDACTED_GITLAB_PAT]` |
 | **Slack Bot / User Token** | `DLP-SLK-TOK-001` | Regex: `\b(xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,32})\b` | Redact | `[REDACTED_SLACK_TOKEN]` |
-| **Private Cryptographic Keys** | `DLP-CRY-KEY-001` | Regex: `-----BEGIN (?:RSA \|EC \|DSA \|OPENSSH \|PGP )?PRIVATE KEY-----` | **Hard Block (HTTP 422)** | N/A (Request Rejected) |
-| **Database Connection URI**| `DLP-DB-URI-001` | Regex: `(?i)(?:postgres\|mysql\|mongodb(?:\+srv)?\|redis):\/\/[^:\s]+:([^@\s]+)@` | **Hard Block (HTTP 422)** | N/A (Request Rejected) |
 | **JSON Web Token (JWT)** | `DLP-JWT-001` | Regex: `\beyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]*\b` | Redact | `[REDACTED_JWT_TOKEN]` |
-| **Credit Card Numbers** | `DLP-PII-CC-001` | Regex + Luhn Algorithm: `\b(?:\d{4}[ -]?){3}\d{4}\b` | Redact | `[REDACTED_CREDIT_CARD]` |
-| **Japan Individual Number**| `DLP-PII-MYNUM-001`| Regex + Modulus 11: 12-digit Japanese My Number | Redact | `[REDACTED_JAPAN_MY_NUMBER]` |
 
-* **`[FR-DLP-03]` SSRF & Parameter Stripping:** The gateway MUST parse and sanitize all incoming JSON payloads, stripping client-supplied routing override parameters (`api_base`, `base_url`, `api_key`, `custom_llm_provider`, `mock_response`).
-* **`[FR-DLP-04]` Anti-Agent Exfiltration Defenses:** Outbound stream sanitizers MUST strip external markdown image exfiltration tags (`![...](http...)`) to prevent unauthorized file leaks via rendered IDE markdown views.
+* **`[FR-DLP-04]` Regulatory & Japan Sovereign PII Redaction:**
+  * **Japan Individual Number (My Number - `DLP-PII-MYNUM-001`):** 12-digit number validated with the official Modulus 11 check digit algorithm $\rightarrow$ Redact with `[REDACTED_JAPAN_MY_NUMBER]`.
+  * **Credit Card Numbers (`DLP-PII-CC-001`):** 13–19 digits validated with the Luhn checksum $\rightarrow$ Redact with `[REDACTED_CREDIT_CARD]`.
+
+* **`[FR-DLP-05]` Amazon Bedrock Guardrails Integration:**
+  * All interactive developer prompts targeting Amazon Bedrock Runtime MUST pass the active Guardrail identifier and version (`guardrailIdentifier` and `guardrailVersion`) in the upstream invocation request.
+  * **Prompt Attack Defense:** The Guardrail MUST enforce **HIGH** strength filtering on prompt attacks, preventing adversarial jailbreaks from overriding corporate system instructions.
+  * **Denied Topics:** The Guardrail MUST enforce strict topic policies blocking generation of malware payloads, remote exploitation scripts, or credential harvesting tools.
+  * **Intervention Response:** If a Bedrock Guardrail blocks an interaction, the gateway MUST return an `HTTP 400 Bad Request` with an RFC 7807 payload detailing the guardrail action without exposing internal security rule internals:
+
+```json
+{
+  "type": "https://llm-gateway.internal.corp/errors/guardrail-intervention",
+  "title": "Amazon Bedrock Guardrail Intervention",
+  "status": 400,
+  "detail": "The request violated corporate AI safety policies (Prompt Attack or Denied Topic).",
+  "instance": "/v1/chat/completions/req_01J7K8M9",
+  "action": "GUARDRAIL_INTERVENED"
+}
+```
+
+* **`[FR-DLP-06]` Source Code False-Positive Protection:** Generic PII filters (e.g. natural language names, addresses) MUST NOT be applied indiscriminately to programming language syntax. The DLP engine MUST apply syntax-aware heuristics (such as AST comment scoping or variable name allowlisting) to ensure that code identifiers (e.g. `user_name = "test"`, `customer_id`) are never corrupted.
+* **`[FR-DLP-07]` 128-Character Outbound SSE Sliding-Window Buffer:** To prevent credential leakage across split SSE chunk boundaries, the outbound streaming transformer MUST evaluate a 128-character ring buffer before yielding flushed chunks to client IDEs (< 1.0ms overhead).
+* **`[FR-DLP-08]` Anti-Agent Exfiltration Defenses:**
+  * The gateway MUST strip client-supplied routing override parameters (`api_base`, `base_url`, `api_key`, `custom_llm_provider`, `mock_response`).
+  * Outbound stream transformers MUST detect and strip external Markdown image links (`![...](http...)`) pointing to non-corporate domains to prevent indirect prompt injection file exfiltration.
 
 ---
 
@@ -457,7 +530,7 @@ The following **8 Golden Rules** govern corporate policy and architectural opera
 | `[FR-INT-01..03]` | OIDC SSO with PKCE, CLI RFC 8628 Device Flow, Workload Identity | [INFRASTRUCTURE_SPEC.md §2.5](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
 | `[FR-KEY-01..06]` | Virtual Key SHA-256 storage, Tiers 1-4, JIT, Teams Adaptive Cards | [INFRASTRUCTURE_SPEC.md §1](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
 | `[FR-FIN-01..08]` | Real-time pricing, atomic Lua pre-flight reservation, S3 Parquet, Athena | [INFRASTRUCTURE_SPEC.md §5.2](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
-| `[FR-DLP-01..05]` | In-line DLP pattern catalog, 128-char SSE buffer, SSRF filter | [INFRASTRUCTURE_SPEC.md §4.1](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
+| `[FR-DLP-01..08]` | Hybrid 3-tier DLP, Bedrock Guardrails, in-memory regex, SSE buffer | [INFRASTRUCTURE_SPEC.md §2.11](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
 | `[FR-AUD-01..04]` | Zero-payload logging, CloudWatch KMS CMK, Git remote verification | [INFRASTRUCTURE_SPEC.md §2.8](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
 | `[NFR-PERF-01..03]`| <20ms proxy overhead, 300s timeout, unbuffered SSE streaming | [INFRASTRUCTURE_SPEC.md §3.2](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
 | `[NFR-AVAIL-01]` | 99.9% monthly engineering hours availability, 3-AZ Multi-AZ spread | [INFRASTRUCTURE_SPEC.md §3.1](INFRASTRUCTURE_SPEC.md) | **VERIFIED** |
