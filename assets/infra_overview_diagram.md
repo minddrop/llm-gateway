@@ -2,7 +2,7 @@
 
 ![Internal Enterprise Engineering LLM Gateway Architecture](infra_overview_diagram.jpg)
 
-This document provides the high-level architecture overview and subnet tier mapping corresponding to the authoritative physical infrastructure specification in [INFRASTRUCTURE_SPEC.md](../INFRASTRUCTURE_SPEC.md).
+This document provides the high-level architecture overview, network topology, and Multi-AZ subnet tier mapping corresponding to the authoritative physical infrastructure specification in [INFRASTRUCTURE_SPEC.md](../INFRASTRUCTURE_SPEC.md) and functional requirements in [REQUIREMENTS.md](../REQUIREMENTS.md).
 
 ---
 
@@ -33,12 +33,13 @@ The platform is deployed in a dedicated, greenfield isolated VPC (`10.100.0.0/16
 
 ### Ingress & Edge Security Tier
 * **Corporate Client Perimeter:** Intune-managed workstations (Cursor, VS Code, terminal CLIs) authenticate via **Microsoft Entra ID (OIDC)** and pass cryptographic device compliance claims.
-* **AWS Verified Access (AVA ZTNA):** Regional edge evaluation of Cedar policies, injecting signed `x-amzn-ava-user-context` headers.
+* **AWS Verified Access (AVA ZTNA):** Regional edge evaluation of Cedar policies, injecting signed `x-amzn-ava-user-context` headers into the VPC.
 * **Ingress Subnets:** Internal Application Load Balancer terminating TLS 1.3, protected by **AWS WAF v2 WebACL** (inspecting AVA context headers and enforcing rate limits).
 
 ### Compute & Application Tier (`App Subnets`)
 * **ECS Fargate Graviton ARM64:** High-performance async proxy containers running Gunicorn with Uvicorn workers.
-* **Dual-Pass DLP Inspection:** Tier 1 in-memory regex scanner (<1.5ms) blocking hard secrets (`HTTP 422`), redacting PII, and stripping outbound exfiltration image tags via a 128-char ring buffer.
+* **Tier 1 In-Memory Regex DLP:** In-line pre-flight scanning (<1.5ms) hard-blocking private keys and DB URIs (`HTTP 422`), redacting SaaS tokens, and stripping client SSRF parameters.
+* **Tier 3 SSE Sliding-Window Buffer:** 128-character ring buffer across SSE chunks catching split credentials and stripping outbound markdown image exfiltration links (`![...](http...)`).
 
 ### Persistence & Caching Tier (`Data Subnets`)
 * **ElastiCache Serverless (Redis / Valkey):** Multi-AZ low-latency state for atomic Lua quota reservations and sliding-window rate limit counters.
@@ -47,7 +48,9 @@ The platform is deployed in a dedicated, greenfield isolated VPC (`10.100.0.0/16
 
 ### Upstream Model & Management Tier (`Endpoint Subnets` / PrivateLink)
 * **AWS PrivateLink Interface Endpoints:** Dedicated private ENIs for zero-egress communication with AWS services.
-* **Amazon Bedrock Guardrails:** Semantic safety layer enforcing Prompt Attack / Jailbreak defense (HIGH filter), denied topic policies, and Japan PII redaction (My Number / credit cards) in front of **Amazon Bedrock Runtime** (`jp.*` sovereign cross-region profiles & Tokyo models) and **Bedrock Mantle**.
+* **Amazon Bedrock Runtime & Mantle:** Upstream Foundation Models deployed across Japan Sovereign Boundaries (`jp.*` cross-region profiles & Tokyo in-region models).
+* **Tier 2: Amazon Bedrock Guardrails:** Natively integrated into **Amazon Bedrock Runtime** calls via `guardrailIdentifier` and `guardrailVersion`. Evaluates Prompt Attack defense at **HIGH** filter strength, denied topic policies, and Japan PII redaction (My Number / credit cards). There is **no separate VPC endpoint** for Guardrails; all invocations route through the `com.amazonaws.ap-northeast-1.bedrock-runtime` PrivateLink endpoint.
+* **FinOps Optimization:** Interactive developer chat and coding prompts enforce Tier 2 Guardrails. High-throughput codebase embeddings (`amazon.titan-embed-text-v2`) bypass Tier 2 Guardrails to eliminate cost amplification ($0.75/1k text units).
 * **Secrets & Encryption:** AWS Secrets Manager for model credentials; KMS Multi-Region Customer Managed Keys (`mrk-llm-gw`) for envelope encryption.
 * **Audit & Storage:** CloudWatch Logs (zero payload, SHA-256 prompt hashes only) and S3 Parquet/WORM buckets with Object Lock.
 
