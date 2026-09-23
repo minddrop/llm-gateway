@@ -43,6 +43,10 @@ To establish technical rationale and maintain documentation integrity over the p
 
 ## 2. Pillar-by-Pillar AWS Well-Architected Blueprint
 
+### 2.0 System Architecture Overview Diagram
+
+![Internal Enterprise Engineering LLM Gateway Architecture](assets/infra_overview_diagram.jpg)
+
 ```
                      AWS Well-Architected Framework Alignment
  ┌─────────────────────────────────────────────────────────────────────────────┐

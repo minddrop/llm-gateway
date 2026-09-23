@@ -44,6 +44,8 @@ llm-gateway/
 
 ## 3. High-Level System Architecture
 
+![Internal Enterprise Engineering LLM Gateway Architecture](assets/infra_overview_diagram.jpg)
+
 ```mermaid
 flowchart TD
     subgraph CorporateClient["Corporate Client Perimeter (Intune MDM)"]
