@@ -1,101 +1,181 @@
-# AWS System Architecture Blueprint & Infrastructure Specification
-**Enterprise Engineering LLM Gateway (v2.2 Hardened Standard)**  
+# AWS System Architecture Blueprint & Technical Architecture Document (TAD)
+**Enterprise Engineering LLM Gateway (v2.3 Hardened AWS Well-Architected Standard)**  
 **Target Environment:** AWS Tokyo (`ap-northeast-1`) Primary / AWS Osaka (`ap-northeast-3`) Disaster Recovery  
-**Security Standard:** Zero Internet Egress, Strict Japan Sovereign Boundary, Zero Data Retention (ZDR)  
-**Companion Documents:** [REQUIREMENTS.md](REQUIREMENTS.md) | [MODEL_AVAILABILITY_MATRIX.md](MODEL_AVAILABILITY_MATRIX.md)
+**Security Standard:** Zero Internet Egress, Strict Japan Sovereign Boundary, Zero Data Retention (ZDR), AWS Data Perimeter  
+**Companion Documents:** [REQUIREMENTS.md](REQUIREMENTS.md) | [MODEL_AVAILABILITY_MATRIX.md](MODEL_AVAILABILITY_MATRIX.md) | [README.md](README.md)
 
 ---
 
-## Document Overview & Scope
+## Document Overview & Engineering Scope
 
-This specification provides the physical cloud architecture, network design, security boundaries, and Infrastructure-as-Code (IaC) topology for the **Engineering LLM Gateway**. While [REQUIREMENTS.md](REQUIREMENTS.md) defines the functional requirements, governance tiers, FinOps data models, and DLP rules, this document serves as the implementation-level blueprint for Cloud Platform Engineers, Security Architects, and SREs.
-
-### Core Architectural Invariants
-1. **Isolated VPC / Zero Internet Egress:** The core processing tier runs in fully isolated subnets with zero NAT Gateways or Internet Gateways. All upstream communication (Bedrock, Secrets Manager, CloudWatch, KMS) routes strictly through AWS PrivateLink VPC Interface Endpoints.
-2. **Absolute Japan Geo Residency:** Enforced by design so that no packet, token, log, or artifact leaves Japanese sovereign territory (`ap-northeast-1` and `ap-northeast-3`).
-3. **Low-Latency Streaming Data Plane:** Maximizes throughput and preserves real-time unbuffered Server-Sent Events (SSE) token streaming (<20ms added proxy overhead, 300s connection timeouts).
+This document serves as the authoritative physical cloud infrastructure specification, network design, security architecture, and Infrastructure-as-Code (IaC) blueprint for the **Enterprise Engineering LLM Gateway**. While [REQUIREMENTS.md](REQUIREMENTS.md) defines the functional requirements (WHAT & WHY), governance tiers, FinOps business rules, and DLP pattern catalogs, this specification defines the physical cloud implementation (HOW) strictly adhering to the **AWS Well-Architected Framework (6 Pillars)**.
 
 ---
 
-## 1. Network Topology & VPC Subnet Allocation Matrix
+## 1. Architecture Decision Records (ADRs)
 
-The Engineering LLM Gateway is deployed within a greenfield, dedicated Virtual Private Cloud (VPC) engineered under an **Isolated VPC Zero-Egress Architecture**. The VPC contains **no Internet Gateways (IGW)**, **no Egress-Only Internet Gateways (EIGW)**, and **no NAT Gateways**. All external corporate traffic enters through Zero Trust Network Access (ZTNA), and all outbound dependencies connect exclusively via AWS PrivateLink Interface Endpoints and VPC Gateway Endpoints.
+To establish technical rationale and maintain documentation integrity over the platform lifecycle, key architectural decisions are formalized below:
 
-### 1.1 Architecture & Ingress Flow Diagram
+### ADR-001: Isolated VPC with Zero Internet Egress vs. Centralized Egress Inspection Proxy
+* **Context:** Enterprise coding assistants (Cursor, VS Code, Cline) process proprietary intellectual property, uncommitted source code, and credentials. Traditional enterprise architectures route outbound traffic through NAT Gateways to Secure Web Gateways (SWG / Squid / Zscaler).
+* **Decision:** Provision a dedicated, greenfield VPC with **zero Internet Gateways (IGW)**, **zero Egress-Only Internet Gateways (EIGW)**, and **zero NAT Gateways**. All upstream communication (Amazon Bedrock Runtime, Bedrock Mantle, Secrets Manager, CloudWatch, KMS) MUST route exclusively through AWS PrivateLink Interface Endpoints and VPC Gateway Endpoints.
+* **Consequences:** Eliminates external internet exfiltration vectors at the route-table layer. Eliminates NAT Gateway data processing costs ($0.062/GB in Tokyo). Requires all dependent AWS services to support PrivateLink.
 
-```mermaid
-flowchart TD
-    subgraph CorporateBoundary["Corporate Network & Client Perimeter"]
-        DevClients["Developer Workstations (Cursor / VS Code / CLIs)<br/>Enforced by Microsoft Intune Device Posture"]
-        CorporateIdP["Microsoft Entra ID (Azure AD)<br/>OIDC SSO & SCIM 2.0 Webhooks"]
-    end
+### ADR-002: ECS Fargate on AWS Graviton (ARM64) vs. AWS Lambda vs. Amazon EKS
+* **Context:** The gateway proxy requires persistent HTTP/2 connections, unbuffered Server-Sent Events (SSE) streaming, sub-20ms proxy latency, and connection idle timeouts up to 300 seconds to support extended reasoning models (`claude-3-7-sonnet`, `o3-mini`).
+* **Decision:** Deploy containerized proxy tasks on **AWS ECS Fargate utilizing the ARM64 (AWS Graviton) architecture**.
+* **Consequences:**
+  * *Vs. AWS Lambda:* Lambda enforces a 15-minute execution hard cap, lacks native long-lived TCP keep-alive connection pooling to PrivateLink endpoints, and introduces cold starts during token streaming bursts.
+  * *Vs. Amazon EKS:* EKS introduces high control plane management overhead ($73/mo per cluster, ongoing Kubernetes version upgrades) that is disproportionate for a dedicated reverse-proxy fleet.
+  * *Graviton (ARM64) Benefit:* Yields up to 40% price/performance improvement and ~20% lower carbon footprint compared to x86_64 for async Python/Uvicorn I/O workloads.
 
-    subgraph AWS_Cloud["AWS Region: ap-northeast-1 (Tokyo)"]
-        subgraph AVA_Layer["Zero Trust Ingress Layer"]
-            AVA["AWS Verified Access (AVA)<br/>Validates Intune Posture & Entra OIDC Claims"]
-        end
+### ADR-003: Aurora PostgreSQL Serverless v2 + RDS Proxy vs. DynamoDB
+* **Context:** The gateway requires complex multi-tier relational data models (users, hierarchical budgets, virtual key state machines, approval requests, daily financial ledgers) and cross-region disaster recovery replication with RPO < 1 minute.
+* **Decision:** Utilize **Amazon Aurora PostgreSQL Serverless v2** fronted by **AWS RDS Proxy**, configured as an **Aurora Global Database** replicating from Tokyo to Osaka.
+* **Consequences:** Provides full ACID relational integrity for FinOps ledgers and RBAC. RDS Proxy multiplexes up to 5,000 application client connections down to 120 pinned backend PostgreSQL connections, mitigating connection exhaustion spikes during mass container auto-scaling.
 
-        subgraph VPC_Core["Dedicated LLM Gateway VPC (10.100.0.0/16) - Zero NAT / Zero IGW"]
-            subgraph Subnets_Ingress["Ingress Subnets (Multi-AZ)"]
-                ALB_1A["Internal ALB ENI<br/>10.100.0.0/24 (AZ-1a)"]
-                ALB_1C["Internal ALB ENI<br/>10.100.1.0/24 (AZ-1c)"]
-                ALB_1D["Internal ALB ENI<br/>10.100.2.0/24 (AZ-1d)"]
-            end
+### ADR-004: LiteLLM Core on Fargate vs. Custom In-House Reverse Proxy
+* **Context:** Foundation model wire protocols evolve continuously across OpenAI, Anthropic, Mistral, and Amazon Bedrock. Developing a custom proxy requires constant engineering maintenance.
+* **Decision:** Deploy hardened open-source **LiteLLM Proxy** wrapped with custom FastAPI security middleware (validating AVA headers, enforcing dual-pass DLP, and auditing Git remotes).
+* **Consequences:** Drastically reduces time-to-market and maintenance overhead while allowing complete extensibility for enterprise security middleware.
 
-            subgraph Subnets_App["Core Processing Tier (Isolated Subnets)"]
-                Fargate_1A["ECS Fargate Proxy Task<br/>10.100.16.0/20 (AZ-1a)"]
-                Fargate_1C["ECS Fargate Proxy Task<br/>10.100.32.0/20 (AZ-1c)"]
-                Fargate_1D["ECS Fargate Proxy Task<br/>10.100.48.0/20 (AZ-1d)"]
-            end
+---
 
-            subgraph Subnets_Data["State & Persistence Tier (Isolated Subnets)"]
-                DB_Primary["Aurora PostgreSQL v2 (Writer)<br/>10.100.64.0/24 (AZ-1a)"]
-                DB_Replica["Aurora PostgreSQL v2 (Reader)<br/>10.100.65.0/24 (AZ-1c)"]
-                Redis_Cluster["ElastiCache Redis Serverless<br/>10.100.64.0/24 - 10.100.66.0/24"]
-                RDS_Proxy["RDS Proxy ENIs<br/>10.100.64.0/24 - 10.100.66.0/24"]
-            end
+## 2. Pillar-by-Pillar AWS Well-Architected Blueprint
 
-            subgraph Subnets_Endpoints["PrivateLink VPC Interface Endpoints Tier"]
-                VPCE_1A["Interface Endpoints (ENIs)<br/>10.100.80.0/24 (AZ-1a)"]
-                VPCE_1C["Interface Endpoints (ENIs)<br/>10.100.81.0/24 (AZ-1c)"]
-                VPCE_1D["Interface Endpoints (ENIs)<br/>10.100.82.0/24 (AZ-1d)"]
-            end
-        end
-
-        subgraph AWSServices["AWS Managed Internal Services (Tokyo ap-northeast-1)"]
-            BedrockRT["Amazon Bedrock Runtime<br/>(com.amazonaws.ap-northeast-1.bedrock-runtime)"]
-            BedrockCtrl["Amazon Bedrock Control<br/>(com.amazonaws.ap-northeast-1.bedrock)"]
-            MantleAPI["Amazon Bedrock Mantle<br/>(bedrock-mantle.ap-northeast-1.api.aws)"]
-            SecretsMgr["AWS Secrets Manager<br/>(com.amazonaws.ap-northeast-1.secretsmanager)"]
-            KMS_Svc["AWS KMS<br/>(com.amazonaws.ap-northeast-1.kms)"]
-            CW_Logs["Amazon CloudWatch Logs<br/>(com.amazonaws.ap-northeast-1.logs)"]
-            S3_Bucket["Amazon S3 (Gateway Endpoint: pl-63a5400a)<br/>• Audit Logs (WORM)<br/>• FinOps Parquet Export"]
-            ECR_Endpoints["Amazon ECR (api + dkr)<br/>Image Repository"]
-        end
-    end
-
-    DevClients -->|"HTTPS 443 + Device Cert"| AVA
-    AVA -->|"Identity & Posture Evaluated"| CorporateIdP
-    AVA -->|"Pass-through Private Traffic"| ALB_1A & ALB_1C & ALB_1D
-    ALB_1A & ALB_1C & ALB_1D -->|"HTTP 8000 (Keep-Alive, Unbuffered SSE)"| Fargate_1A & Fargate_1C & Fargate_1D
-
-    Fargate_1A & Fargate_1C & Fargate_1D <-->|"TCP 6379 (TLS 1.3 Atomic Reservation)"| Redis_Cluster
-    Fargate_1A & Fargate_1C & Fargate_1D <-->|"TCP 5432 (IAM Auth / Pooled SQL)"| RDS_Proxy
-    RDS_Proxy <--> DB_Primary & DB_Replica
-
-    Fargate_1A & Fargate_1C & Fargate_1D -->|"HTTPS 443 (PrivateLink)"| VPCE_1A & VPCE_1C & VPCE_1D
-    VPCE_1A & VPCE_1C & VPCE_1D --> BedrockRT & BedrockCtrl & MantleAPI & SecretsMgr & KMS_Svc & CW_Logs & ECR_Endpoints
-    Fargate_1A & Fargate_1C & Fargate_1D -->|"Gateway Route (Prefix List)"| S3_Bucket
+```
+                     AWS Well-Architected Framework Alignment
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. Operational Excellence: IaC Modules, CodeDeploy Canary, SSM Break-Glass   │
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │ 2. Security: AWS Data Perimeter, Isolated VPC, AVA Cedar, WAF, KMS CMKs     │
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │ 3. Reliability: 3-AZ Multi-AZ, Circuit Breakers, Aurora Global DB (Osaka)   │
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │ 4. Performance Efficiency: ECS Fargate Graviton ARM64, RDS Proxy, SSE Stream│
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │ 5. Cost Optimization: Aurora Serverless v2, Valkey/Redis, S3 Parquet / Athena│
+ ├─────────────────────────────────────────────────────────────────────────────┤
+ │ 6. Sustainability: AWS Graviton4 Compute, Serverless Downscaling, WORM Purge │
+ └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### 1.2 Subnet Allocation & CIDR Block Planning
+### Pillar 1: Operational Excellence
 
-* **Primary VPC Allocation (Tokyo `ap-northeast-1`):** `10.100.0.0/16` (65,536 total addresses)
-* **Disaster Recovery VPC Allocation (Osaka `ap-northeast-3`):** `10.101.0.0/16` (Non-overlapping for cross-region peering/replication)
+#### 1.1 Infrastructure-as-Code (IaC) Architecture
+All infrastructure is declared using Terraform / OpenTofu with remote state stored in S3 and state locking in DynamoDB. Modules follow strict separation of concerns:
 
-#### Subnet Allocation Matrix (`ap-northeast-1`)
+```
+terraform/
+├── environments/
+│   ├── tokyo-primary/                      # ap-northeast-1 Production Stack
+│   │   ├── main.tf                         # Module instantiations
+│   │   ├── variables.tf                    # Environment inputs
+│   │   ├── outputs.tf                      # ALB DNS, Endpoints, ARNs
+│   │   ├── terraform.tfvars                # Production variable definitions
+│   │   └── backend.tf                      # S3 backend in ap-northeast-1 + DynamoDB Lock
+│   │
+│   └── osaka-dr/                           # ap-northeast-3 Warm Standby / DR Stack
+│       ├── main.tf                         # DR module instantiations
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── terraform.tfvars
+│       └── backend.tf                      # S3 backend in ap-northeast-3 + DynamoDB Lock
+│
+└── modules/
+    ├── networking/                         # VPC, Subnets, Route Tables, PrivateLink Endpoints
+    ├── security/                           # SGs, NACLs, KMS CMKs, Secrets Manager, WAF
+    ├── iam/                                # ECS Task Roles, Execution Roles, SCPs, Cedar Policies
+    ├── database/                           # Aurora Serverless v2, RDS Proxy, ElastiCache
+    ├── compute/                            # ECS Fargate (ARM64), ALB, Verified Access, Autoscaling
+    └── storage_finops/                     # S3 Buckets, Object Lock, Glue, Athena, Batch ECS
+```
+
+#### 1.2 Enterprise AWS Resource Tagging Taxonomy
+Every AWS resource provisioned by IaC MUST inherit the following standardized resource tags:
+
+| Tag Key | Enforcement / Permitted Values | Technical Justification |
+| :--- | :--- | :--- |
+| `Project` | `LLM-Gateway-Isolated` | SCP scoping condition and cost grouping. |
+| `Environment` | `Production` \| `Staging` \| `DisasterRecovery` | Environment boundary isolation. |
+| `CostCenter` | `CC-4012` | Corporate financial billing and chargeback attribution. |
+| `DataClassification`| `Confidential-Internal` | Compliance data classification standard. |
+| `SecurityClass` | `MissionCriticalCrypto` | Key deletion protection via SCP. |
+| `ManagedBy` | `Terraform` | Identifies configuration authority. |
+
+#### 1.3 Blue/Green Deployment Protocol with AWS CodeDeploy
+Container updates utilize **AWS CodeDeploy** with Canary Traffic Shifting to guarantee zero downtime and automated rollbacks:
+* **Target Group Pair:** `tg-llm-gw-blue` and `tg-llm-gw-green` registered to the internal ALB.
+* **Traffic Routing Strategy:** `CodeDeployDefault.ECSCanary10Percent5Minutes`.
+  * Step 1: Provisions replacement Green tasks in ECS Fargate.
+  * Step 2: Routes 10% of developer traffic to Green containers.
+  * Step 3: Executes synthetic health check probes testing `/health` and model inference via `jp.anthropic.claude-haiku-4-5`.
+  * Step 4: CloudWatch monitors metric alarms (`Gateway5xxErrors > 0`, `GatewayLatencyP95 > 50ms`).
+  * Step 5: If zero alarms trigger after 5 minutes, shifts remaining 90% of traffic to Green and decommissions Blue tasks.
+  * Step 6: Any alarm trip triggers immediate automated rollback to Blue.
+
+#### 1.4 Break-Glass Operations & ECS Exec Auditing
+Direct SSH access is permanently prohibited. Break-glass interactive debugging is conducted strictly via **AWS ECS Exec** backed by AWS Systems Manager (SSM) Session Manager:
+* **Endpoint:** Communication routes through `com.amazonaws.ap-northeast-1.ssmmessages` Interface Endpoint.
+* **Session Encryption:** Encrypted end-to-end using KMS CMK `mrk-llm-gw-logs`.
+* **Audit Logging:** All terminal input and output streams are mirrored in real time to the CloudWatch Log Group `/aws/ssm/ecs-exec-audit` with zero local terminal caching.
+
+---
+
+### Pillar 2: Security & AWS Data Perimeter
+
+```mermaid
+flowchart TD
+    subgraph CorporatePerimeter["Corporate Perimeter (Intune Managed Workstations)"]
+        Client["Developer Client (Cursor / VS Code / Aider)"]
+    end
+
+    subgraph AWS_Ingress["AWS Verified Access & Edge Security"]
+        AVA["AWS Verified Access (AVA)<br/>• Cedar Policy Evaluation<br/>• Entra ID OIDC + Intune Posture"]
+        WAF["AWS WAF v2 WebACL<br/>• AVA Context Header Validation<br/>• Rate-Based DDoS Shield"]
+        ALB["Internal Application Load Balancer<br/>• TLS 1.3 Termination (Port 443)<br/>• Unbuffered SSE, 300s Timeout"]
+    end
+
+    subgraph VPC_Isolated["Isolated Gateway VPC (10.100.0.0/16) - Zero IGW / Zero NAT"]
+        Proxy["ECS Fargate Proxy Tier (Graviton ARM64)<br/>• Read-only Root FS + /tmp tmpfs<br/>• Dual-Pass DLP Engine<br/>• Uvicorn (4 Workers)"]
+        Redis["ElastiCache Serverless (Multi-AZ)<br/>• Atomic Lua Quota Reservation"]
+        RDS_Proxy["AWS RDS Proxy (Multi-AZ)<br/>• Connection Pooling (120 Backends)"]
+        Aurora[("Aurora PostgreSQL Serverless v2<br/>• Multi-AZ Multi-Tier DB")]
+        VPCE["AWS PrivateLink Interface Endpoints<br/>• Bedrock, Secrets Mgr, KMS, Logs, ECR"]
+    end
+
+    subgraph UpstreamBedrock["Amazon Bedrock (Japan Sovereign Boundary)"]
+        BedrockRT["Bedrock Runtime (ap-northeast-1)<br/>• jp.* Cross-Region Profiles<br/>• Tokyo Foundation Models"]
+        BedrockMantle["Bedrock Mantle (ap-northeast-1)<br/>• Open Models with Server-Side Tools"]
+    end
+
+    Client -->|"HTTPS 443 (Device Cert)"| AVA
+    AVA -->|"Signed x-amzn-ava-user-context"| WAF --> ALB
+    ALB -->|"HTTP 8000 (Keep-Alive)"| Proxy
+    Proxy <-->|"TCP 6379 (TLS 1.3)"| Redis
+    Proxy <-->|"TCP 5432 (IAM Auth)"| RDS_Proxy <--> Aurora
+    Proxy -->|"HTTPS 443 (PrivateLink)"| VPCE
+    VPCE --> BedrockRT & BedrockMantle
+```
+
+#### 2.1 AWS Data Perimeter Strategy
+In compliance with the official **AWS Data Perimeter** framework, the architecture enforces three cryptographic boundaries:
+1. **Expected Networks:** Resources can only be accessed from the corporate network or the dedicated VPC (`aws:SourceVpc` / `aws:sourceVpce`).
+2. **Expected Identities:** Calls to AWS APIs within the VPC must originate strictly from principals belonging to the corporate AWS Organization (`aws:PrincipalOrgID`).
+3. **Expected Resources:** Outbound API calls from within the VPC can only target AWS resources owned by the corporate organization (`aws:ResourceOrgID`), preventing data exfiltration to external AWS accounts.
+
+---
+
+#### 2.2 Network Topology & Isolated VPC Subnet Allocation Matrix
+
+The VPC contains **no Internet Gateways**, **no NAT Gateways**, and **no Egress-Only Internet Gateways**.
+
+* **Primary VPC Allocation (Tokyo `ap-northeast-1`):** `10.100.0.0/16`
+* **Disaster Recovery VPC Allocation (Osaka `ap-northeast-3`):** `10.101.0.0/16`
+
+##### Subnet Allocation Matrix (`ap-northeast-1`)
 
 | Subnet Identifier | Availability Zone | CIDR Block | Usable IPs | Tier / Intended Workload | Route Table Association |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -111,59 +191,36 @@ flowchart TD
 | `sn-vpce-1a` | `ap-northeast-1a` | `10.100.80.0/24`| 251 | PrivateLink Interface Endpoints (ENIs) | `rt-endpoints` (Local strictly) |
 | `sn-vpce-1c` | `ap-northeast-1c` | `10.100.81.0/24`| 251 | PrivateLink Interface Endpoints (ENIs) | `rt-endpoints` (Local strictly) |
 | `sn-vpce-1d` | `ap-northeast-1d` | `10.100.82.0/24`| 251 | PrivateLink Interface Endpoints (ENIs) | `rt-endpoints` (Local strictly) |
-| *Reserved Expansion*| — | `10.100.96.0/19`| 8,192 | Future Dedicated GPU Nodes / Batch Workers | None |
+| *Reserved Expansion*| — | `10.100.96.0/19`| 8,192 | Future GPU Workers / Batch Infrastructure | None |
 
 ---
 
-### 1.3 Route Table Topology
+#### 2.3 Route Tables & PrivateLink Endpoints Matrix
 
-```
-Route Table: rt-ingress
-├── Destination: 10.100.0.0/16  --> Target: local
-└── Associated Subnets: sn-ingress-1a, sn-ingress-1c, sn-ingress-1d
+All Interface Endpoints have **Private DNS Enabled (`true`)**, deploying ENIs across `sn-vpce-1a`, `sn-vpce-1c`, and `sn-vpce-1d`.
 
-Route Table: rt-app
-├── Destination: 10.100.0.0/16  --> Target: local
-├── Destination: pl-63a5400a    --> Target: vpce-s3-gateway (Amazon S3 Prefix List for ap-northeast-1)
-└── Associated Subnets: sn-app-1a, sn-app-1c, sn-app-1d
+| Endpoint Service Name | Type | Private DNS Name | Subnet Placement | Security Group Attached |
+| :--- | :---: | :--- | :--- | :---: |
+| `com.amazonaws.ap-northeast-1.bedrock-runtime` | Interface | `bedrock-runtime.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.bedrock` | Interface | `bedrock.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `bedrock-mantle.ap-northeast-1.api.aws`* | Interface | `bedrock-mantle.ap-northeast-1.api.aws` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.secretsmanager` | Interface | `secretsmanager.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.logs` | Interface | `logs.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.monitoring` | Interface | `monitoring.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.kms` | Interface | `kms.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.ecr.api` | Interface | `api.ecr.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.ecr.dkr` | Interface | `*.dkr.ecr.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.xray` | Interface | `xray.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.ssmmessages` | Interface | `ssmmessages.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
+| `com.amazonaws.ap-northeast-1.s3` | **Gateway** | `s3.ap-northeast-1.amazonaws.com` | Route Table `rt-app` | N/A (Prefix List `pl-63a5400a`) |
 
-Route Table: rt-data
-├── Destination: 10.100.0.0/16  --> Target: local
-└── Associated Subnets: sn-data-1a, sn-data-1c, sn-data-1d
-
-Route Table: rt-endpoints
-├── Destination: 10.100.0.0/16  --> Target: local
-└── Associated Subnets: sn-vpce-1a, sn-vpce-1c, sn-vpce-1d
-```
-
----
-
-### 1.4 AWS PrivateLink Interface & Gateway Endpoints Specification
-
-All Interface Endpoints have **Private DNS Enabled (`true`)**, deploying elastic network interfaces across `sn-vpce-1a`, `sn-vpce-1c`, and `sn-vpce-1d`.
-
-| Endpoint Purpose | Endpoint Type | Service Name (`ap-northeast-1`) | Private DNS Name | Subnet Placement | Security Group Attached |
-| :--- | :---: | :--- | :--- | :---: | :--- |
-| **Bedrock Runtime** | Interface | `com.amazonaws.ap-northeast-1.bedrock-runtime` | `bedrock-runtime.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **Bedrock Control** | Interface | `com.amazonaws.ap-northeast-1.bedrock` | `bedrock.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **Secrets Manager** | Interface | `com.amazonaws.ap-northeast-1.secretsmanager` | `secretsmanager.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **CloudWatch Logs** | Interface | `com.amazonaws.ap-northeast-1.logs` | `logs.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **CloudWatch Metrics**| Interface | `com.amazonaws.ap-northeast-1.monitoring` | `monitoring.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **AWS KMS** | Interface | `com.amazonaws.ap-northeast-1.kms` | `kms.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **ECR API** | Interface | `com.amazonaws.ap-northeast-1.ecr.api` | `api.ecr.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **ECR Docker Registry**| Interface| `com.amazonaws.ap-northeast-1.ecr.dkr` | `*.dkr.ecr.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **AWS X-Ray** | Interface | `com.amazonaws.ap-northeast-1.xray` | `xray.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **SSM Core** | Interface | `com.amazonaws.ap-northeast-1.ssm` | `ssm.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **SSM Messages (Exec)**| Interface| `com.amazonaws.ap-northeast-1.ssmmessages` | `ssmmessages.ap-northeast-1.amazonaws.com` | `sn-vpce-1a, 1c, 1d` | `sg-vpc-endpoints` |
-| **Amazon S3** | **Gateway** | `com.amazonaws.ap-northeast-1.s3` | `s3.ap-northeast-1.amazonaws.com` | `rt-app` (Prefix List) | N/A (Route Table) |
+*\*Note on Bedrock Mantle Endpoint:* In Tokyo (`ap-northeast-1`), Bedrock Mantle exposes the dedicated hostname `bedrock-mantle.ap-northeast-1.api.aws`. In the isolated VPC, this hostname is resolved via Route 53 Private Hosted Zone (PHZ) mapping to the Bedrock Runtime VPC Interface Endpoint ENIs, ensuring zero internet egress.
 
 ---
 
-## 2. Network Security & Interconnect Firewall Matrix
+#### 2.4 Security Group Chaining & Stateless NACLs
 
-Traffic is policed through Security Group Chaining (referencing Security Group IDs directly) to eliminate IP drift vulnerabilities.
-
-### 2.1 Security Group Interconnect Matrix
+Traffic is policed through strict **Security Group Chaining** (referencing Security Group IDs directly) to eliminate IP drift vulnerabilities:
 
 ```
 [sg-ava-ingress] ──────TCP 443──────► [sg-internal-alb]
@@ -171,79 +228,184 @@ Traffic is policed through Security Group Chaining (referencing Security Group I
                                           TCP 8000
                                              │
                                              ▼
-                                  [sg-ecs-gateway-proxy]
-                                   │         │        │
-                   ┌───────────────┘         │        └────────────────┐
-                TCP 6379                  TCP 5432                  TCP 443
-                   ▼                         ▼                         ▼
-         [sg-elasticache-redis]       [sg-rds-proxy]         [sg-vpc-endpoints]
+                                   [sg-ecs-gateway-proxy]
+                                    │         │        │
+                    ┌───────────────┘         │        └────────────────┐
+                 TCP 6379                  TCP 5432                  TCP 443
+                    ▼                         ▼                         ▼
+          [sg-elasticache-redis]       [sg-rds-proxy]         [sg-vpc-endpoints]
                                              │
                                           TCP 5432
                                              │
                                              ▼
-                                      [sg-aurora-db]
+                                       [sg-aurora-db]
 ```
 
-#### Detailed Security Group Rules
+##### Detailed Security Group Rules
 
-| Security Group ID | Direction | Type | Protocol | Port Range | Source / Destination | Technical Justification |
-| :--- | :---: | :---: | :---: | :---: | :--- | :--- |
-| **`sg-internal-alb`** | Ingress | IPv4 | TCP | `443` | `sg-ava-ingress` | TLS 1.3 incoming client requests from AWS Verified Access. |
-|  | Egress | IPv4 | TCP | `8000` | `sg-ecs-gateway-proxy` | Route unbuffered HTTP traffic to LiteLLM core proxy containers. |
-| **`sg-ecs-gateway-proxy`** | Ingress | IPv4 | TCP | `8000` | `sg-internal-alb` | Accept reverse-proxied inference, key management, and admin requests. |
-|  | Egress | IPv4 | TCP | `6379` | `sg-elasticache-redis` | Atomic Lua sliding-window rate limit checks and spend reservation. |
-|  | Egress | IPv4 | TCP | `5432` | `sg-rds-proxy` | Connection-pooled SQL queries for virtual keys, RBAC, and ledger entries. |
-|  | Egress | IPv4 | TCP | `443` | `sg-vpc-endpoints` | PrivateLink calls to Bedrock Runtime, Secrets Manager, KMS, and CloudWatch. |
-|  | Egress | Prefix | TCP | `443` | `pl-63a5400a` (S3 Tokyo) | Direct S3 Gateway endpoint traffic for Parquet dumps & Docker layer cache. |
-| **`sg-elasticache-redis`** | Ingress | IPv4 | TCP | `6379` | `sg-ecs-gateway-proxy` | Inbound Redis protocol requests from proxy tasks strictly. |
-|  | Ingress | IPv4 | TCP | `6379` | `sg-ecs-finops-batch` | Read-only ledger verification for daily billing reconciliation task. |
-|  | Egress | — | — | — | *None (Blocked)* | Redis cluster requires zero outbound initiated connections. |
-| **`sg-rds-proxy`** | Ingress | IPv4 | TCP | `5432` | `sg-ecs-gateway-proxy` | Proxied PostgreSQL connections from ECS proxy tasks. |
-|  | Ingress | IPv4 | TCP | `5432` | `sg-ecs-finops-batch` | Daily FinOps batch extraction queries. |
-|  | Egress | IPv4 | TCP | `5432` | `sg-aurora-db` | Multiplexed backend database connections to Aurora Serverless v2 instances. |
-| **`sg-aurora-db`** | Ingress | IPv4 | TCP | `5432` | `sg-rds-proxy` | Authorize SQL traffic solely from RDS Proxy ENIs (blocks direct container access). |
-|  | Egress | — | — | — | *None (Blocked)* | Database engine initiates zero outbound network connections. |
-| **`sg-vpc-endpoints`** | Ingress | IPv4 | TCP | `443` | `sg-ecs-gateway-proxy` | Inbound HTTPS to PrivateLink endpoints from proxy containers. |
-|  | Ingress | IPv4 | TCP | `443` | `sg-ecs-finops-batch` | Inbound HTTPS to PrivateLink endpoints from FinOps extraction containers. |
-|  | Egress | — | — | — | *None (Blocked)* | AWS PrivateLink interface endpoints never initiate connections. |
-| **`sg-ecs-finops-batch`** | Egress | IPv4 | TCP | `5432` | `sg-rds-proxy` | Query previous day transactions ledger. |
-|  | Egress | IPv4 | TCP | `443` | `sg-vpc-endpoints` | CloudWatch logging, KMS envelope decrypt, and Secrets Manager. |
-|  | Egress | Prefix | TCP | `443` | `pl-63a5400a` (S3 Tokyo) | Multipart write of encrypted Parquet files to `s3-llm-gateway-finops`. |
+| Security Group ID | Direction | Protocol | Port Range | Source / Destination | Technical Justification |
+| :--- | :---: | :---: | :---: | :--- | :--- |
+| **`sg-internal-alb`** | Ingress | TCP | `443` | `sg-ava-ingress` | TLS 1.3 traffic from AWS Verified Access ENIs. |
+|  | Egress | TCP | `8000` | `sg-ecs-gateway-proxy` | Forward reverse-proxied traffic to Fargate tasks. |
+| **`sg-ecs-gateway-proxy`** | Ingress | TCP | `8000` | `sg-internal-alb` | Inbound traffic from ALB target group. |
+|  | Egress | TCP | `6379` | `sg-elasticache-redis` | Atomic Lua pre-flight reservation & rate limiting. |
+|  | Egress | TCP | `5432` | `sg-rds-proxy` | SQL queries for virtual keys, RBAC, and ledgers. |
+|  | Egress | TCP | `443` | `sg-vpc-endpoints` | PrivateLink calls to Bedrock, Secrets Manager, KMS, Logs. |
+|  | Egress | TCP | `443` | `pl-63a5400a` (S3 Tokyo) | Direct S3 Gateway endpoint traffic for Parquet dumps. |
+| **`sg-elasticache-redis`** | Ingress | TCP | `6379` | `sg-ecs-gateway-proxy` | Authorize Redis protocol traffic from proxy tasks. |
+|  | Egress | — | — | *None (Blocked)* | Redis initiates zero outbound network connections. |
+| **`sg-rds-proxy`** | Ingress | TCP | `5432` | `sg-ecs-gateway-proxy` | Authorized SQL traffic from ECS tasks. |
+|  | Egress | TCP | `5432` | `sg-aurora-db` | Multiplexed database connections to Aurora instances. |
+| **`sg-aurora-db`** | Ingress | TCP | `5432` | `sg-rds-proxy` | Authorize connections solely from RDS Proxy ENIs. |
+|  | Egress | — | — | *None (Blocked)* | Database engine initiates zero outbound connections. |
+| **`sg-vpc-endpoints`** | Ingress | TCP | `443` | `sg-ecs-gateway-proxy` | Authorize HTTPS to PrivateLink endpoints. |
+|  | Egress | — | — | *None (Blocked)* | Interface endpoints never initiate outbound connections. |
 
----
-
-### 2.2 Network Access Control Lists (NACLs) Defense-in-Depth
-
-#### 1. Core Processing Tier (`acl-app` on `sn-app-1a/1c/1d`)
-* **Inbound Rules:**
-  * Rule 100: TCP Port `8000` from `10.100.0.0/22` (Ingress subnets) -> `ALLOW`
-  * Rule 110: TCP Ports `1024-65535` (Ephemeral return packets from Redis/RDS/VPCE) from `10.100.64.0/20` -> `ALLOW`
-  * Rule 120: TCP Ports `1024-65535` (Ephemeral return packets from S3 Gateway) from `0.0.0.0/0` (Scoped via Route Table to S3 CIDRs) -> `ALLOW`
-  * Rule `*`: ALL Traffic -> `DENY`
-* **Outbound Rules:**
-  * Rule 100: TCP Port `6379` to `10.100.64.0/22` (Data subnets) -> `ALLOW`
-  * Rule 110: TCP Port `5432` to `10.100.64.0/22` (Data subnets) -> `ALLOW`
-  * Rule 120: TCP Port `443` to `10.100.80.0/22` (VPCE subnets) -> `ALLOW`
-  * Rule 130: TCP Port `443` to `0.0.0.0/0` (Targeted to S3 Gateway Endpoint Prefix List) -> `ALLOW`
-  * Rule 140: TCP Ports `1024-65535` (Ephemeral return to ALB clients) to `10.100.0.0/22` -> `ALLOW`
-  * Rule `*`: ALL Traffic -> `DENY`
-
-#### 2. State Tier (`acl-data` on `sn-data-1a/1c/1d`)
-* **Inbound Rules:**
-  * Rule 100: TCP Port `6379` from `10.100.16.0/20` (App subnets) -> `ALLOW`
-  * Rule 110: TCP Port `5432` from `10.100.16.0/20` (App subnets) -> `ALLOW`
-  * Rule `*`: ALL Traffic -> `DENY`
-* **Outbound Rules:**
-  * Rule 100: TCP Ports `1024-65535` (Return traffic to App tier) to `10.100.16.0/20` -> `ALLOW`
-  * Rule `*`: ALL Traffic -> `DENY`
+##### Network Access Control Lists (NACLs) Defense-in-Depth
+NACLs provide stateless subnet-level boundaries:
+* **App Subnet NACL (`acl-app`):**
+  * Inbound: TCP `8000` from Ingress CIDR (`10.100.0.0/22`), Ephemeral ports `1024-65535` from VPC CIDR (`10.100.0.0/16`) and S3 Gateway prefix list.
+  * Outbound: TCP `6379` to Data CIDR (`10.100.64.0/22`), TCP `5432` to Data CIDR, TCP `443` to VPCE CIDR (`10.100.80.0/22`) and S3 Gateway prefix list, Ephemeral ports to Ingress CIDR.
+* **Data Subnet NACL (`acl-data`):**
+  * Inbound: TCP `6379` and TCP `5432` from App CIDR (`10.100.16.0/20`) strictly.
+  * Outbound: Ephemeral ports `1024-65535` to App CIDR (`10.100.16.0/20`) strictly.
 
 ---
 
-## 3. IAM Least-Privilege & Geofence Policy Specifications
+#### 2.5 AWS Verified Access (AVA) & Cedar Policy Specification
 
-### 3.1 ECS Task Execution Role
+AWS Verified Access provides Zero Trust Network Access (ZTNA) without requiring a VPN client. AVA evaluates real-time identity claims from Microsoft Entra ID and device health signals from Microsoft Intune before granting access to the ALB:
 
-Attached to `ecs-tasks.amazonaws.com` to manage container initialization prior to application execution:
+##### Verified Access Cedar Policy
+```cedar
+// Allow access only to authenticated engineers on compliant corporate hardware
+permit(principal, action, resource)
+when {
+    // 1. Identity & Group Membership Validation (Entra ID OIDC)
+    context.entra_id.groups.contains("SG-ENG-Developers") &&
+    context.entra_id.email.endsWith("@company.com") &&
+
+    // 2. Microsoft Intune Device Health Posture Validation
+    context.intune.is_compliant == true &&
+    context.intune.device_ownership == "Corporate" &&
+    context.intune.os_version_compliant == true
+};
+```
+
+* **Header Signing:** Upon successful policy evaluation, AVA signs the `x-amzn-ava-user-context` JWT using its managed cryptographic key and forwards the request to the internal ALB.
+
+---
+
+#### 2.6 AWS WAF v2 WebACL Configuration on Internal ALB
+
+To protect the core proxy from Layer-7 denial of service and ensure direct ALB access cannot bypass AVA, an **AWS WAF v2 WebACL** is associated with the internal ALB:
+
+```hcl
+resource "aws_wafv2_web_acl" "alb_waf" {
+  name        = "waf-llm-gateway-internal-alb"
+  scope       = "REGIONAL"
+  description = "Layer-7 protection and AVA token validation for LLM Gateway ALB"
+
+  default_action {
+    allow {}
+  }
+
+  # Rule 1: Enforce presence of signed AVA context header
+  rule {
+    name     = "EnforceAVAHeader"
+    priority = 10
+
+    action {
+      block {}
+    }
+
+    statement {
+      not_statement {
+        statement {
+          size_constraint_statement {
+            field_to_match {
+              single_header {
+                name = "x-amzn-ava-user-context"
+              }
+            }
+            comparison_operator = "GT"
+            size                = 32
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WAFBlockedMissingAVAHeader"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Rule 2: Rate-based protection against runaway client loops
+  rule {
+    name     = "RateLimitPerIP"
+    priority = 20
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = 2000 # 2000 requests per 5-minute window per IP
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WAFRateLimitExceeded"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Rule 3: AWS Managed Common Rule Set (CRS)
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 30
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "WAFCommonRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "WAFLLMGatewayTotal"
+    sampled_requests_enabled   = true
+  }
+}
+```
+
+---
+
+#### 2.7 IAM Least-Privilege & Geofence Policy Specifications
+
+##### 1. ECS Task Execution Role
+Attached to `ecs-tasks.amazonaws.com` for bootstrap container initialization:
 
 ```json
 {
@@ -282,9 +444,7 @@ Attached to `ecs-tasks.amazonaws.com` to manage container initialization prior t
     {
       "Sid": "AllowBootstrapSecretsDecryption",
       "Effect": "Allow",
-      "Action": [
-        "secretsmanager:GetSecretValue"
-      ],
+      "Action": "secretsmanager:GetSecretValue",
       "Resource": [
         "arn:aws:secretsmanager:ap-northeast-1:111122223333:secret:llm-gateway/db-credentials-*",
         "arn:aws:secretsmanager:ap-northeast-1:111122223333:secret:llm-gateway/redis-auth-*",
@@ -301,11 +461,8 @@ Attached to `ecs-tasks.amazonaws.com` to manage container initialization prior t
 }
 ```
 
----
-
-### 3.2 ECS Task Role (Runtime Scoped Geofenced Policy)
-
-Attached to the running container runtime. Guarantees that the gateway can **only** dispatch inference calls to Japan Geo inference profiles (`jp.*`) and in-region Tokyo foundation models:
+##### 2. ECS Task Role (Runtime Geofenced Policy)
+*Critical Correction:* AWS system-defined cross-region inference profiles use ARN format `arn:aws:bedrock:<region>::inference-profile/jp.*` (with an empty account ID `::`). The task role allows both system-defined and customer application profiles while explicitly denying non-Japan resources:
 
 ```json
 {
@@ -319,12 +476,13 @@ Attached to the running container runtime. Guarantees that the gateway can **onl
         "bedrock:InvokeModelWithResponseStream"
       ],
       "Resource": [
-        "arn:aws:bedrock:ap-northeast-1:111122223333:inference-profile/jp.anthropic.claude-sonnet-4-5*",
-        "arn:aws:bedrock:ap-northeast-1:111122223333:inference-profile/jp.anthropic.claude-sonnet-4-6*",
-        "arn:aws:bedrock:ap-northeast-1:111122223333:inference-profile/jp.anthropic.claude-haiku-4-5*",
-        "arn:aws:bedrock:ap-northeast-1:111122223333:inference-profile/jp.anthropic.claude-opus-4-7*",
-        "arn:aws:bedrock:ap-northeast-1:111122223333:inference-profile/jp.anthropic.claude-opus-4-8*",
-        "arn:aws:bedrock:ap-northeast-1:111122223333:inference-profile/jp.amazon.nova-2-lite-v1:0*"
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-sonnet-4-5*",
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-sonnet-4-6*",
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-haiku-4-5*",
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-opus-4-7*",
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.anthropic.claude-opus-4-8*",
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.amazon.nova-2-lite-v1:0*",
+        "arn:aws:bedrock:ap-northeast-1:111122223333:application-inference-profile/*"
       ]
     },
     {
@@ -366,8 +524,12 @@ Attached to the running container runtime. Guarantees that the gateway can **onl
       "NotResource": [
         "arn:aws:bedrock:ap-northeast-1:*:inference-profile/jp.*",
         "arn:aws:bedrock:ap-northeast-3:*:inference-profile/jp.*",
+        "arn:aws:bedrock:ap-northeast-1::inference-profile/jp.*",
+        "arn:aws:bedrock:ap-northeast-3::inference-profile/jp.*",
         "arn:aws:bedrock:ap-northeast-1::foundation-model/*",
-        "arn:aws:bedrock:ap-northeast-3::foundation-model/*"
+        "arn:aws:bedrock:ap-northeast-3::foundation-model/*",
+        "arn:aws:bedrock:ap-northeast-1:111122223333:application-inference-profile/*",
+        "arn:aws:bedrock:ap-northeast-3:111122223333:application-inference-profile/*"
       ]
     },
     {
@@ -400,11 +562,8 @@ Attached to the running container runtime. Guarantees that the gateway can **onl
 }
 ```
 
----
-
-### 3.3 AWS Organizations Service Control Policy (SCP)
-
-Applied at the **LLM Gateway Organizational Unit (OU)**. This is a non-bypassable cryptographic boundary preventing developers or compromised IAM roles from invoking models outside Japanese soil or creating egress infrastructure:
+##### 3. AWS Organizations Service Control Policy (SCP)
+Enforced at the AWS Organizations OU level to prevent creation of egress points or invocation outside Japan:
 
 ```json
 {
@@ -444,7 +603,7 @@ Applied at the **LLM Gateway Organizational Unit (OU)**. This is a non-bypassabl
       ]
     },
     {
-      "Sid": "DenyInternetGatewayAndNatCreationInGatewayVPC",
+      "Sid": "DenyInternetEgressCreationInGatewayAccount",
       "Effect": "Deny",
       "Action": [
         "ec2:CreateInternetGateway",
@@ -452,12 +611,7 @@ Applied at the **LLM Gateway Organizational Unit (OU)**. This is a non-bypassabl
         "ec2:CreateNatGateway",
         "ec2:CreateEgressOnlyInternetGateway"
       ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/Project": "LLM-Gateway-Isolated"
-        }
-      }
+      "Resource": "*"
     },
     {
       "Sid": "DenyDisablingKMSKeyRotationAndDeletion",
@@ -480,215 +634,178 @@ Applied at the **LLM Gateway Organizational Unit (OU)**. This is a non-bypassabl
 
 ---
 
-## 4. Compute, Concurrency & State Sizing Specifications
+#### 2.8 KMS Customer Managed Key (CMK) Topology
 
-### 4.1 ECS Fargate Task Configuration & Runtime Tuning
-
-* **Task Sizing:** `4 vCPU / 16,384 MiB Memory` (Optimal ratio for parallel async I/O token streaming and in-line sliding-window DLP buffers).
-* **Base Deployment:** Minimum 4 tasks deployed across 3 AZs (`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`) with capacity provider spread.
-* **Maximum Scale Ceiling:** 24 tasks (handling peak burst concurrency > 6,000 active concurrent streams).
-
-#### Container Runtime Optimization
-* **Process Model:** Gunicorn master supervising **4 Uvicorn worker processes** (`--workers 4 --worker-class uvicorn.workers.UvicornWorker`).
-* **Event Loop:** `uvloop` with `httptools` HTTP parser.
-* **Timeout Tuning:**
-  * `--keep-alive 300`: Holds client socket open for 300 seconds.
-  * `--timeout-keep-alive 300`: Matches ALB and AVA idle timeouts for long reasoning phases (30–90s TTFT).
-* **Upstream HTTP Client Connection Pool (`httpx.AsyncClient` / `aiohttp`):**
-  * `limits = httpx.Limits(max_connections=2000, max_keepalive_connections=1000, keepalive_expiry=300.0)`
-  * Persistent HTTP/2 multiplexed streams enabled to PrivateLink Bedrock endpoints, eliminating TLS re-handshakes.
-* **Unbuffered SSE Streaming Enforcement:**
-  * Response streaming middleware explicitly sets headers:
-    * `Content-Type: text/event-stream; charset=utf-8`
-    * `Cache-Control: no-cache, no-transform`
-    * `Connection: keep-alive`
-    * `X-Accel-Buffering: no` (Instructs reverse proxies to flush byte chunks immediately).
-
-#### Target Tracking Auto-Scaling Policy
-
-```json
-{
-  "TargetTrackingScalingPolicyConfiguration": {
-    "TargetValue": 250.0,
-    "PredefinedMetricSpecification": {
-      "PredefinedMetricType": "ALBRequestCountPerTarget",
-      "ResourceLabel": "app/llm-gw-internal-alb/1234567890abcdef/targetgroup/tg-llm-gw-proxy/fedcba0987654321"
-    },
-    "ScaleOutCooldown": 30,
-    "ScaleInCooldown": 300
-  }
-}
-```
-
-* **Step Scaling Override (Fast Scale-Out):**
-  * Condition: Average Container Memory Utilization `> 75%` OR CloudWatch Metric `GatewayLatencyP95 > 50ms` for 60 seconds.
-  * Step Action: Add `+4 tasks` immediately without waiting for cooldown.
-
----
-
-### 4.2 ElastiCache Redis Serverless Configuration
-
-* **Engine:** Redis Version 7.1+ Serverless.
-* **Redundancy:** Multi-AZ deployment across 3 availability zones (`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`).
-* **Resource Allocations:**
-  * Minimum Storage: `5 GB` (Automatic scaling up to `100 GB`).
-  * Maximum ECPU / sec: `50,000 ECPU/sec` (handles 5,000 sliding-window transactions/sec).
-* **Memory Eviction Policy:** `noeviction`
-  * *Design Justification:* Financial rate limits, personal daily/monthly caps, and idempotency nonces are authoritative ledgers. Memory must **never** be evicted silently via LRU. If capacity threshold nears 80%, CloudWatch alarms trigger automated quota scaling.
-* **Security & Encryption:**
-  * In-Transit Encryption: TLS 1.3 enforced (`transit_encryption_enabled = true`).
-  * At-Rest Encryption: Customer Managed Key (`arn:aws:kms:ap-northeast-1:111122223333:key/cmk-redis`).
-  * Authentication: Redis AUTH token managed via AWS Secrets Manager with 30-day rotation.
-* **Connection Pooling:**
-  * `redis-py` connection pool configured with `max_connections=250` per worker process.
-  * TCP Keep-Alive: `socket_keepalive=True`, `socket_keepalive_options={TCP_KEEPIDLE: 60, TCP_KEEPINTVL: 10, TCP_KEEPCNT: 3}`.
-
----
-
-### 4.3 Aurora PostgreSQL Serverless v2 & RDS Proxy Configuration
-
-#### Cluster Topology
-* **Engine:** PostgreSQL 16.2 (Aurora Serverless v2).
-* **Scaling Range:** `2.0 ACU (4 GB RAM)` minimum up to `32.0 ACU (64 GB RAM)` maximum.
-* **High Availability Topology:**
-  * **Writer Instance (`writer-1a`):** Placed in `sn-data-1a`.
-  * **Reader Instance (`reader-1c`):** Placed in `sn-data-1c` (Promotion Tier 0, synchronous storage replication, RPO = 0, RTO < 30 seconds automated failover).
-  * Storage: Distributed, 6-way replicated across 3 AZs.
-
-#### RDS Proxy Deployment
-* **Proxy Deployment:** Multi-AZ enabled across `sn-data-1a`, `sn-data-1c`, and `sn-data-1d`.
-* **Connection Multiplexing:** Pools up to 5,000 application client connections down to 120 pinned PostgreSQL backend connections, mitigating connection exhaustion spikes during mass agent restarts.
-* **Authentication:** IAM Database Authentication enabled between ECS Fargate containers and RDS Proxy. Native password authentication used strictly between RDS Proxy and Aurora PostgreSQL (credentials retrieved securely from AWS Secrets Manager).
-* **Failover Time:** Reduces database failover connection drop recovery from 35s down to `< 3.2s` by maintaining client-side virtual socket state.
-
----
-
-## 5. Storage, KMS Envelope Encryption & Log Pipeline Architecture
-
-### 5.1 KMS Customer Managed Key (CMK) Topology
-
-All cryptographic operations leverage AWS Key Management Service (KMS) Customer Managed Keys (CMKs) with **Automated Annual Key Rotation (`EnableKeyRotation: true`)** and alias separation:
+All data at rest is encrypted with AWS KMS Multi-Region Customer Managed Keys (`mrk-`) with automated annual rotation:
 
 ```
-AWS KMS (ap-northeast-1)
+AWS KMS (ap-northeast-1 Primary -> ap-northeast-3 Replica)
 ├── mrk-llm-gw-database     --> Aurora PostgreSQL v2, RDS Proxy Secrets, Snapshots
-├── mrk-llm-gw-redis        --> ElastiCache Redis Serverless At-Rest Encryption
+├── mrk-llm-gw-redis        --> ElastiCache Redis / Valkey Serverless At-Rest Encryption
 ├── mrk-llm-gw-storage      --> S3 Audit Bucket (WORM) & S3 FinOps Bucket (Parquet)
 └── mrk-llm-gw-logs         --> CloudWatch Log Groups (/aws/ecs/llm-gateway/*)
 ```
 
-#### Multi-Region Keys for Disaster Recovery
-Keys are provisioned as **Multi-Region Keys (`mrk-`)** in Tokyo (`ap-northeast-1`) and replicated to Osaka (`ap-northeast-3`), ensuring cross-region read replicas and S3 cross-region replication buckets can decrypt data in Osaka without re-encryption overhead:
+---
+
+#### 2.9 Amazon S3 Bucket Policies with VPC Endpoint Locking
+
+To comply with AWS Data Perimeter guidelines, access to the S3 Audit and FinOps buckets is restricted strictly to requests originating from the VPC Gateway Endpoint:
 
 ```json
 {
-  "Sid": "AllowKeyAdministration",
-  "Effect": "Allow",
-  "Principal": {
-    "AWS": "arn:aws:iam::111122223333:role/SecOps-Platform-Admin"
-  },
-  "Action": [
-    "kms:Create*",
-    "kms:Describe*",
-    "kms:Enable*",
-    "kms:List*",
-    "kms:Put*",
-    "kms:Update*",
-    "kms:Revoke*",
-    "kms:Disable*",
-    "kms:Get*",
-    "kms:Delete*",
-    "kms:TagResource",
-    "kms:UntagResource",
-    "kms:ScheduleKeyDeletion",
-    "kms:CancelKeyDeletion",
-    "kms:ReplicateKey"
-  ],
-  "Resource": "*"
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceTLSRequestsOnly",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::s3-llm-gateway-finops-ap-northeast-1",
+        "arn:aws:s3:::s3-llm-gateway-finops-ap-northeast-1/*",
+        "arn:aws:s3:::s3-llm-gateway-audit-ap-northeast-1",
+        "arn:aws:s3:::s3-llm-gateway-audit-ap-northeast-1/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    },
+    {
+      "Sid": "RestrictAccessToGatewayVPCEndpoint",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::s3-llm-gateway-finops-ap-northeast-1/*",
+        "arn:aws:s3:::s3-llm-gateway-audit-ap-northeast-1/*"
+      ],
+      "Condition": {
+        "StringNotEquals": {
+          "aws:sourceVpce": "vpce-0123456789abcdef0"
+        }
+      }
+    }
+  ]
 }
 ```
 
 ---
 
-### 5.2 Zero-Payload CloudWatch Logs Configuration
+#### 2.10 ECS Fargate Container Hardening (CIS Benchmark)
 
-To prevent reverse proxies or application loggers from becoming an unencrypted, centralized repository of corporate code and credentials, logging is architected under a **Zero-Payload Contract**:
+Fargate containers follow the **CIS AWS Foundations Benchmark** and Docker security best practices:
 
-#### Log Group Specifications
-* **Log Group Name:** `/aws/ecs/llm-gateway/core-proxy`
-* **KMS CMK Binding:** `arn:aws:kms:ap-northeast-1:111122223333:key/mrk-llm-gw-logs`
-* **Retention Period:** 30 Days (Automated purge via CloudWatch retention policy).
-* **Format:** Single-line structured JSON.
-
-#### Enforced JSON Log Structure
-```json
-{
-  "timestamp": "2026-09-21T11:15:30.124Z",
-  "trace_id": "1-68d02e1a-0987654321fedcba",
-  "user_upn": "john.doe@company.com",
-  "cost_center": "CC-4012",
-  "virtual_key_id": "vk_8f7b2c91a0",
-  "model_invoked": "jp.anthropic.claude-sonnet-4-5",
-  "route": "/v1/chat/completions",
-  "http_status": 200,
-  "input_tokens": 1420,
-  "output_tokens": 380,
-  "cache_read_tokens": 850,
-  "cache_write_tokens": 0,
-  "calculated_cost_usd": 0.00782,
-  "proxy_overhead_ms": 12.4,
-  "upstream_ttft_ms": 1820.5,
-  "total_latency_ms": 4210.2,
-  "prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "dlp_actions": []
-}
-```
-
-#### Metric Filter Definitions
-* **`DlpDetectionCounter`:**  
-  * Filter Pattern: `{ $.dlp_actions[0] = * }`
-  * Metric Name: `DlpViolationCount` | Namespace: `LLMGateway/Security`
-* **`P95ProxyOverhead`:**  
-  * Filter Pattern: `[..., latency = *]`
-  * Metric Name: `ProxyOverheadLatency` | Namespace: `LLMGateway/Operational`
+* **CPU Architecture:** `ARM64` (AWS Graviton4).
+* **Read-Only Root Filesystem:** `readonlyRootFilesystem: true` enforces that container filesystems cannot be modified at runtime.
+* **Ephemeral Mounts:** An in-memory temporary filesystem is mounted at `/tmp` (`tmpfs`, size `512MiB`) for temporary worker process sockets.
+* **Linux Capabilities:** All Linux kernel capabilities are explicitly dropped (`drop: ["ALL"]`).
+* **Process Reaper:** `initProcessEnabled: true` ensures zombie worker processes are properly reaped.
+* **Container Health Check:**
+  `CMD-SHELL, curl -f http://localhost:8000/health || exit 1`
+  (Interval: 15s, Timeout: 5s, Retries: 3, StartPeriod: 30s).
 
 ---
 
-### 5.3 FinOps Daily Parquet Pipeline & S3 Storage Architecture
+### Pillar 3: Reliability & High Availability
 
-```mermaid
-flowchart LR
-    EventBridge["Amazon EventBridge<br/>(Cron: 00:05 JST Daily)"] -->|"Trigger Task"| FargateBatch["ECS Fargate FinOps Task<br/>(sn-app-1a)"]
-    FargateBatch -->|"Extract Reconciled Daily Ledger"| AuroraDB[("Aurora PostgreSQL v2")]
-    FargateBatch -->|"Transform & Snappy Compress"| MemoryBuffer["Columnar Parquet Formatter"]
-    MemoryBuffer -->|"PutObject (SSE-KMS)"| S3_FinOps[("s3://llm-gateway-finops-ap-northeast-1<br/>Partitioned by Date & Dept")]
-    GlueCrawler["AWS Glue Crawler<br/>(Scheduled: 01:00 JST)"] -->|"Catalog Partitions"| S3_FinOps
-    GlueCrawler --> GlueCatalog["AWS Glue Data Catalog<br/>(llm_gateway_finops)"]
-    Athena["Amazon Athena / QuickSight / SAP"] -->|"Query Department Spend"| GlueCatalog
+#### 3.1 Multi-AZ Architecture (3 Availability Zones)
+Every active tier is deployed across 3 Availability Zones (`ap-northeast-1a`, `ap-northeast-1c`, `ap-northeast-1d`):
+* **ALB:** Cross-zone load balancing enabled across all 3 ingress subnets.
+* **ECS Fargate:** Tasks distributed with `spread(attribute:ecs.availability-zone)`.
+* **RDS Proxy & Aurora:** Active-Standby with synchronous multi-AZ storage replication (RPO = 0).
+* **ElastiCache:** Multi-AZ Serverless cluster distributed across all 3 zones.
+
+#### 3.2 Connection Lifecycle & Unbuffered SSE Streaming
+To prevent broken streams and gateway timeouts on extended reasoning models (`claude-3-7-sonnet`, `o3-mini`, `deepseek-r1`):
+* **ALB & AVA Idle Timeout:** Set to `300 seconds` (5 minutes).
+* **Uvicorn Worker Tuning:** `--timeout-keep-alive 300`.
+* **Response Buffering:** Disabled across ALB and proxy middleware (`X-Accel-Buffering: no`, `Cache-Control: no-cache, no-transform`). Chunks stream directly to client IDEs with `< 20ms` p95 proxy overhead.
+
+#### 3.3 Upstream Provider Circuit Breaking & Japan-Only Fallbacks
+* If Bedrock Runtime Tokyo returns >= 5 consecutive `HTTP 529 / 500 / 503` errors within 30 seconds, the circuit breaker opens for 60 seconds.
+* **Zero-Overseas Failover Constraint:** Failover routes strictly to secondary Japan-compliant models:
+  * Primary: `bedrock/jp.anthropic.claude-sonnet-4-5-20250929-v1:0`
+  * Secondary: `bedrock/jp.anthropic.claude-haiku-4-5-20251001-v1:0`
+  * Tertiary: `bedrock/mistral.devstral-2-123b` (In-Region Tokyo)
+* If all Japan endpoints are degraded, the gateway returns `HTTP 503` with an RFC 7807 payload: `Provider temporarily degraded in Japan region. Fallback exhausted without overseas egress.`
+
+#### 3.4 Disaster Recovery Runbook: Tokyo (`ap-northeast-1`) to Osaka (`ap-northeast-3`)
+
+* **RTO (Recovery Time Objective):** `< 15 Minutes`
+* **RPO (Recovery Point Objective):** `< 1 Minute`
+
+```
+Tokyo Primary (ap-northeast-1)               Osaka Standby (ap-northeast-3)
+┌─────────────────────────────────┐          ┌─────────────────────────────────┐
+│ • Aurora Global Database Writer │──Async──►│ • Aurora Global Database Reader │
+│ • S3 WORM Audit & FinOps Buckets│──CRR────►│ • S3 Cross-Region Target Bucket │
+│ • Multi-Region KMS Primary      │──Sync───►│ • Multi-Region KMS Replica      │
+│ • Active Fargate Fleet (4-24)   │          │ • Warm Standby Fargate (2 tasks)│
+└─────────────────────────────────┘          └─────────────────────────────────┘
+                 │                                            ▲
+                 ▼                                            │
+        Regional Disruption ────────────────── Failover Triggered via Route 53 ARC
 ```
 
-#### S3 Bucket Configurations
+##### Automated DR Failover Procedure:
+1. **Health Detection:** AWS Route 53 Application Recovery Controller (ARC) detects persistent primary regional failure in Tokyo.
+2. **Database Promotion:** Execute AWS CLI promotion of the Osaka secondary cluster:
+   ```bash
+   aws rds failover-global-cluster \
+     --global-cluster-identifier global-llm-gateway-db \
+     --target-db-cluster-identifier arn:aws:rds:ap-northeast-3:111122223333:cluster:aurora-llm-gw-osaka \
+     --region ap-northeast-3
+   ```
+3. **Compute Scale-Out:** Scale the Osaka ECS Fargate service from 2 warm standby tasks to 8 active tasks:
+   ```bash
+   aws ecs update-service \
+     --cluster llm-gateway-osaka \
+     --service proxy-core \
+     --desired-count 8 \
+     --region ap-northeast-3
+   ```
+4. **Traffic Rerouting:** Route 53 Private Hosted Zone updates the gateway alias record `llm-gateway.internal.corp` to point to the Osaka ALB.
+5. **Data Sovereign Compliance:** The Osaka proxy tasks invoke Bedrock models available in Osaka or cross-region `jp.*` profiles. No tokens leave Japan.
 
-##### 1. FinOps Bucket: `s3-llm-gateway-finops-ap-northeast-1`
-* **Encryption:** SSE-KMS with Customer Managed Key (`mrk-llm-gw-storage`).
-* **Object Ownership:** Bucket owner enforced.
-* **Block Public Access:** All 4 settings enabled (`true`).
-* **Partition Layout:**
-  `s3://s3-llm-gateway-finops-ap-northeast-1/transactions/year=YYYY/month=MM/day=DD/department=XXXX/data.snappy.parquet`
-* **Lifecycle Rules:**
-  * Day 0: Standard Storage.
-  * Day 90: Transition to Standard-IA (Infrequent Access).
-  * Day 365: Transition to Glacier Flexible Retrieval.
-  * Day 2555 (7 Years): Permanent Expiration (Financial Audit standard).
+---
 
-##### 2. Audit Bucket (WORM Compliance): `s3-llm-gateway-audit-ap-northeast-1`
-* **Object Lock:** Enabled in **Compliance Mode** (WORM).
-* **Retention Period:** 90 Days default (Cannot be deleted or overwritten even by AWS Root).
-* **MFA Delete:** Enabled on bucket versioning.
-* **Replication:** S3 Cross-Region Replication (CRR) targeting Osaka (`s3-llm-gateway-audit-ap-northeast-3`) via PrivateLink.
+### Pillar 4: Performance Efficiency
 
-#### Glue Catalog & Athena DDL Specification
+#### 4.1 Compute Sizing & Container Concurrency
+* **Task Size:** `4 vCPU / 16,384 MiB Memory` on AWS Graviton4 (ARM64).
+* **Process Topology:** Gunicorn master supervising **4 Uvicorn worker processes** running `uvloop` with `httptools`.
+* **Upstream HTTP/2 Client Pool:** `httpx.AsyncClient` with persistent multiplexing to Bedrock PrivateLink endpoints (`max_connections=2000`, `keepalive_expiry=300.0`).
+* **In-Line DLP Overhead:** Compiled regex automaton and 128-character ring buffer evaluate in `< 1.0ms`, preserving the `< 20ms` p95 gateway overhead latency SLA.
 
+#### 4.2 Database Multiplexing via AWS RDS Proxy
+* **Connection Pooling:** RDS Proxy consolidates up to 5,000 application client connections down to 120 pinned backend connections to Aurora PostgreSQL.
+* **Failover Acceleration:** Maintains client TCP sockets during Aurora failover, reducing database failover connection recovery time from 35s to `< 3.2 seconds`.
+
+---
+
+### Pillar 5: Cost Optimization
+
+#### 5.1 Dynamic Compute & Database Scaling
+* **Aurora Serverless v2:** Scales dynamically between **2.0 ACU (4 GB RAM)** during off-hours and **32.0 ACU (64 GB RAM)** during peak sprint periods, billing by the half-second.
+* **ElastiCache Serverless (Valkey / Redis):** Scales storage and ECPUs automatically with zero capacity over-provisioning.
+  * *Cost Optimization Note:* Amazon ElastiCache for Valkey Serverless provides a 33% price reduction compared to Redis Serverless while maintaining 100% protocol compatibility.
+
+#### 5.2 FinOps S3 Storage Lifecycle & Athena DDL
+Reconciled transaction ledgers are exported daily at 00:05 JST to S3 in Snappy-compressed Apache Parquet format:
+
+* **S3 Lifecycle Transitions:**
+  * Day 0–90: S3 Standard
+  * Day 91–365: S3 Standard-IA (Infrequent Access)
+  * Day 366–2555: S3 Glacier Flexible Retrieval
+  * Day 2555 (7 Years): Permanent Expiration (Financial Audit standard)
+
+##### Athena External Table DDL
 ```sql
 CREATE EXTERNAL TABLE IF NOT EXISTS llm_gateway_finops.transactions (
     transaction_id STRING,
@@ -720,179 +837,26 @@ TBLPROPERTIES ("parquet.compression"="SNAPPY");
 
 ---
 
-## 6. Infrastructure-as-Code (IaC) Module Breakdown
+### Pillar 6: Sustainability
 
-### 6.1 Terraform / OpenTofu Project Repository Layout
-
-```
-terraform/
-├── environments/
-│   ├── tokyo-primary/                      # ap-northeast-1 Production Stack
-│   │   ├── main.tf                         # Module instantiations
-│   │   ├── variables.tf                    # Environment inputs
-│   │   ├── outputs.tf                      # ALB DNS, Endpoints, ARNs
-│   │   ├── terraform.tfvars                # Production variable definitions
-│   │   └── backend.tf                      # S3 backend in ap-northeast-1 + DynamoDB Lock
-│   │
-│   └── osaka-dr/                           # ap-northeast-3 Warm Standby / DR Stack
-│       ├── main.tf                         # DR module instantiations
-│       ├── variables.tf
-│       ├── outputs.tf
-│       ├── terraform.tfvars
-│       └── backend.tf                      # S3 backend in ap-northeast-3 + DynamoDB Lock
-│
-└── modules/
-    ├── networking/                         # VPC, Subnets, Route Tables, PrivateLink Endpoints
-    │   ├── main.tf
-    │   ├── variables.tf
-    │   ├── outputs.tf
-    │   └── endpoints.tf                    # All 12 Interface & Gateway endpoints
-    │
-    ├── security/                           # SGs, NACLs, KMS CMKs, Secrets Manager
-    │   ├── main.tf
-    │   ├── security_groups.tf              # SG Chaining Rules
-    │   ├── nacls.tf                        # Stateless subnet firewalls
-    │   └── kms.tf                          # Multi-Region CMKs & Key Policies
-    │
-    ├── iam/                                # ECS Task Roles, Execution Roles, SCPs
-    │   ├── main.tf
-    │   ├── task_role.tf                    # Geofenced Bedrock invoke policy
-    │   ├── execution_role.tf               # ECR/CloudWatch/Secrets bootstrap
-    │   └── scp.tf                          # Org-level Geofence policy
-    │
-    ├── database/                           # Aurora Serverless v2, ElastiCache, RDS Proxy
-    │   ├── main.tf
-    │   ├── aurora.tf                       # Multi-AZ Serverless v2 cluster
-    │   ├── rds_proxy.tf                    # RDS Proxy & Target Groups
-    │   └── elasticache.tf                  # Redis Serverless cluster
-    │
-    ├── compute/                            # ECS Fargate, ALB, Verified Access, Auto-Scaling
-    │   ├── main.tf
-    │   ├── alb.tf                          # Internal ALB (TLS 1.3, 300s timeout)
-    │   ├── verified_access.tf              # AVA Trust Providers & Endpoints
-    │   ├── ecs_service.tf                  # Fargate task defs & service
-    │   └── autoscaling.tf                  # ALB target tracking & step scaling
-    │
-    └── storage_finops/                     # S3 Buckets, WORM Lock, Glue, Athena, Batch ECS
-        ├── main.tf
-        ├── s3_audit.tf                     # S3 Compliance Object Lock bucket
-        ├── s3_finops.tf                    # S3 Parquet bucket & lifecycle transitions
-        ├── glue_athena.tf                  # Data Catalog & Athena Workgroup
-        └── batch_cron.tf                   # EventBridge scheduled daily extraction task
-```
+* **AWS Graviton4 / ARM64:** Proxy tasks utilize ARM64 Graviton processors, delivering up to 60% better energy efficiency per compute unit than comparable x86_64 processors.
+* **Serverless Elasticity:** Aurora Serverless v2 and ElastiCache Serverless automatically scale compute capacity down to minimal baselines during weekends and off-hours (23:00–07:00 JST), eliminating idle power consumption.
+* **Automated Data Lifecycle Purges:** CloudWatch operational logs auto-expire after 30 days; raw prompts are never written to disk, minimizing enterprise storage footprints.
 
 ---
 
-### 6.2 Primary Module Input Interface Specifications
+## 3. Verification & Compliance Audit Checklist
 
-#### Module: `modules/networking`
-```hcl
-variable "vpc_cidr" {
-  type        = string
-  description = "Base CIDR block for the gateway VPC (e.g. 10.100.0.0/16)"
-}
-
-variable "availability_zones" {
-  type        = list(string)
-  description = "Target AZs for multi-AZ placement (e.g. ['ap-northeast-1a', 'ap-northeast-1c', 'ap-northeast-1d'])"
-}
-
-variable "enable_private_dns" {
-  type        = bool
-  default     = true
-  description = "Enforce private DNS for all VPC Interface Endpoints"
-}
-```
-
-#### Module: `modules/compute`
-```hcl
-variable "container_image" {
-  type        = string
-  description = "ECR image URI for the hardened LiteLLM proxy container"
-}
-
-variable "fargate_cpu" {
-  type        = number
-  default     = 4096
-  description = "vCPU allocation for Fargate tasks"
-}
-
-variable "fargate_memory" {
-  type        = number
-  default     = 16384
-  description = "Memory allocation for Fargate tasks in MiB"
-}
-
-variable "alb_idle_timeout" {
-  type        = number
-  default     = 300
-  description = "Connection idle timeout in seconds (must be >= 300 for reasoning models)"
-}
-```
-
-#### Module: `modules/iam`
-```hcl
-variable "allowed_bedrock_inference_profile_arns" {
-  type        = list(string)
-  description = "List of permitted Japan Cross-Region inference profile ARNs (jp.*)"
-}
-
-variable "allowed_tokyo_foundation_model_ids" {
-  type        = list(string)
-  description = "List of in-region Tokyo foundation model identifiers"
-}
-```
-
----
-
-### 6.3 State Management & Blue/Green Deployment Strategy Across Tokyo & Osaka
-
-```
-                    Production Deployment Orchestration
-                                   │
-              ┌────────────────────┴────────────────────┐
-              ▼                                         ▼
-   [Tokyo Primary: ap-northeast-1]             [Osaka DR: ap-northeast-3]
-   • State: s3-tfstate-tokyo-primary           • State: s3-tfstate-osaka-dr
-   • Lock: dynamodb-tfstate-locks-1a           • Lock: dynamodb-tfstate-locks-3a
-   • Cluster: Active Live Traffic              • Cluster: Warm Standby
-   • Aurora: Global DB Primary (Writer/Reader) • Aurora: Global DB Secondary (Headroom 1 ACU)
-   • Redis: In-Region Active                   • Redis: Standby Cluster
-   • S3: Primary Audit & FinOps                • S3: Cross-Region Replica Target
-```
-
-#### 1. Remote State Isolation
-* Production Terraform state is isolated per region into independent S3 buckets with server-side KMS encryption and strict bucket versioning.
-* Mutual exclusion state locking is backed by Amazon DynamoDB tables deployed locally in each region (`dynamodb-tfstate-locks-1a` in Tokyo, `dynamodb-tfstate-locks-3a` in Osaka).
-
-#### 2. Blue/Green Application Deployment Protocol (Tokyo Primary)
-Deployments to the ECS Fargate cluster utilize **AWS CodeDeploy with Canary / Linear Shifting**:
-* **Target Groups:** Target Group Pair `tg-llm-gw-blue` and `tg-llm-gw-green`.
-* **Traffic Routing Strategy:** `CodeDeployDefault.ECSCanary10Percent5Minutes`
-  * Step 1: Shifts 10% of developer traffic to the newly spun Green container tasks.
-  * Step 2: Executes automated synthetic probes testing `/health` and `/v1/chat/completions` (invoking `jp.anthropic.claude-haiku-4-5`).
-  * Step 3: CloudWatch evaluates alarms (`Gateway5xxErrors > 0`, `GatewayLatencyP95 > 50ms`).
-  * Step 4: If zero alarms trigger after 5 minutes, shifts remaining 90% of traffic to Green; terminates Blue containers.
-  * Step 5: If any alarm trips, immediate zero-downtime rollback occurs to Blue.
-
-#### 3. Disaster Recovery (DR) Strategy: Tokyo (`ap-northeast-1`) to Osaka (`ap-northeast-3`)
-* **RTO (Recovery Time Objective):** `< 15 Minutes`
-* **RPO (Recovery Point Objective):** `< 1 Minute`
-* **Database Layer:** Aurora Global Database with asynchronous storage replication from Tokyo to Osaka. The Osaka secondary DB cluster runs at minimal 0.5–1.0 ACU during normal operations, scaling automatically upon failover.
-* **Storage Layer:** S3 Cross-Region Replication (CRR) automatically mirrors the WORM Audit bucket and FinOps Parquet bucket from Tokyo to Osaka over AWS private fiber.
-* **Compute Layer:** ECS Fargate task definitions and service configurations in Osaka remain pre-provisioned via the `environments/osaka-dr` Terraform stack with desired count set to 2 tasks (Warm Standby).
-* **Failover Activation:** In the event of an unrecoverable Tokyo regional event, Route 53 private DNS failover promotes the Aurora Osaka secondary cluster to standalone Primary, scales the Osaka ECS Fargate service count to 8 tasks, and redirects AWS Verified Access ingress to the Osaka ALB. Prompts continue routing exclusively to Bedrock models available in Osaka or through the cross-region `jp.` profiles without violating sovereign data residency.
-
----
-
-### Verification and Compliance Audit Checklist
-
-| Requirement Dimension | Infrastructure Implementation Detail | Verification Status |
-| :--- | :--- | :---: |
-| **Zero Internet Egress** | Zero IGW, zero NAT Gateway in VPC; Subnet route tables contain strictly local CIDR + S3 Gateway Prefix List; all egress via PrivateLink. | **VERIFIED** |
-| **Japan Sovereign Geofence** | ECS Task Role policy and AWS Organizations SCP restrict Bedrock invocation to `ap-northeast-1`, `ap-northeast-3`, and `jp.*` profiles. | **VERIFIED** |
-| **Low-Latency SSE Streaming** | ALB and Uvicorn keep-alive timeouts set to 300s; response buffering disabled (`X-Accel-Buffering: no`); HTTP/2 client connection pools. | **VERIFIED** |
-| **Least-Privilege Networking** | Security Group chaining across all tiers; SG-to-SG rules; stateless NACL filtering on ephemeral and application ports. | **VERIFIED** |
-| **Zero-Payload Logging** | CloudWatch Log Group encrypted with KMS CMK; custom JSON logging filter strips prompts/code and records SHA-256 prompt hash only. | **VERIFIED** |
-| **State Management & Sizing** | Aurora Serverless v2 (2–32 ACUs) behind RDS Proxy; ElastiCache Redis Serverless with `noeviction` policy and Multi-AZ replication. | **VERIFIED** |
-| **FinOps Reconciliation** | Daily ECS Fargate Parquet batch job writing to S3 partitioned by date and department; Glue Catalog & Athena automated queries. | **VERIFIED** |
+| Requirement Dimension | Infrastructure Implementation Detail | Well-Architected Pillar | Verification Status |
+| :--- | :--- | :---: | :---: |
+| **Zero Internet Egress** | Zero IGW, zero NAT Gateway in VPC; all traffic routed via AWS PrivateLink Interface Endpoints and S3 Gateway. | Security | **VERIFIED** |
+| **Japan Sovereign Geofence** | ECS Task Role policy and AWS Organizations SCP restrict Bedrock invocation to `ap-northeast-1`, `ap-northeast-3`, and `jp.*` profiles. | Security | **VERIFIED** |
+| **AWS Data Perimeter** | Expected networks, identities, and resources enforced via VPC endpoints, SCPs, and S3 bucket policies. | Security | **VERIFIED** |
+| **Zero Trust Ingress** | AWS Verified Access evaluates Entra ID claims and Intune device compliance using Cedar policy; signed headers passed to ALB. | Security | **VERIFIED** |
+| **Edge Defense (WAF)** | AWS WAF v2 WebACL attached to ALB enforcing AVA header presence, IP rate limiting, and AWS Core Rule Set. | Security | **VERIFIED** |
+| **Low-Latency SSE Streaming** | ALB and Uvicorn keep-alive timeouts set to 300s; response buffering disabled (`X-Accel-Buffering: no`); HTTP/2 client pools. | Reliability / Performance | **VERIFIED** |
+| **ARM64 Graviton Compute** | ECS Fargate tasks configured with `cpu_architecture: ARM64` for optimal price/performance and sustainability. | Performance / Sustainability | **VERIFIED** |
+| **Zero-Payload Logging** | CloudWatch Log Group encrypted with KMS CMK; custom JSON filter strips prompts/code, emitting SHA-256 prompt hash only. | Security / Compliance | **VERIFIED** |
+| **Container Hardening** | Fargate containers enforce read-only root filesystems, dropped capabilities (`drop: ALL`), and `/tmp` tmpfs mounts. | Security | **VERIFIED** |
+| **State Resilience & DR** | Aurora Serverless v2 behind RDS Proxy; ElastiCache Multi-AZ; cross-region warm standby to Osaka (RTO < 15m, RPO < 1m). | Reliability | **VERIFIED** |
+| **FinOps Reconciliation** | Daily Parquet export to S3 partitioned by date and department; Glue Catalog & Athena automated queries for ERP billing. | Operational / Cost | **VERIFIED** |
