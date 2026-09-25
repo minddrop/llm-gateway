@@ -742,7 +742,8 @@ To resolve the trade-offs between speed, cost, and safety (where pure regex lack
    * **SSRF Parameter Stripping:** Removes client-supplied routing parameters (`api_base`, `base_url`, `api_key`, `custom_llm_provider`, `mock_response`).
 
 2. **Tier 2 (Amazon Bedrock Guardrails):**
-   * **Managed Model Protection:** Attached to upstream Bedrock Runtime invocations via PrivateLink (`guardrailIdentifier` and `guardrailVersion`).
+   * **Managed Model Protection:** Attached to upstream Bedrock Runtime invocations via PrivateLink (`guardrailIdentifier` and `guardrailVersion`). Evaluated natively within the Bedrock service plane (no separate VPC endpoint).
+   * **Bedrock Mantle Exclusion:** Amazon Bedrock Mantle does **not** natively support Bedrock Guardrails. Invocations directed to `bedrock-mantle.ap-northeast-1.api.aws` bypass Tier 2 Guardrails and rely exclusively on Tier 1 container-edge filtering and Tier 3 SSE post-flight inspection.
    * **Prompt Attack / Jailbreak Defense:** Evaluates prompt intent at **HIGH** filter strength, neutralizing indirect prompt injection and corporate instruction override attacks.
    * **Denied Topics:** Hard-blocks generation of malware payloads, reverse-engineering exploits, or credential harvesting routines.
    * **PII Masking:** Redacts Japanese My Number and Credit Card information.

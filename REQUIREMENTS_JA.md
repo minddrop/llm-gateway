@@ -330,6 +330,7 @@ s3://s3-llm-gateway-finops-ap-northeast-1/transactions/year=YYYY/month=MM/day=DD
 
 * **`[FR-DLP-05]` Amazon Bedrock Guardrails 統合:**
   * Amazon Bedrock Runtime を対象とする開発者の対話型プロンプトはすべて、アップストリーム呼び出し時にアクティブな Guardrail 識別子とバージョン（`guardrailIdentifier` および `guardrailVersion`）を渡さなければならない（MUST）。
+  * **Bedrock Mantle の除外:** Bedrock Mantle（`bedrock-mantle.<region>.api.aws`）は Amazon Bedrock Guardrails をネイティブサポートしていません。`bedrock-mantle` へルーティングされるリクエストは第2層 Guardrails をバイパスし、第1層エッジDLPおよび第3層SSEフィルタリングに依存します。
   * **プロンプト攻撃防御:** Guardrail はプロンプト攻撃に対して **HIGH** 強度のフィルタリングを強制し、社内システム指示の上書きや敵対的ジェイルブレイクを阻止しなければならない（MUST）。
   * **禁止トピック:** マルウェア、リモートエクスプロイト、認証情報収奪ツールの生成要求を拒絶するトピックポリシーを強制しなければならない（MUST）。
   * **介入レスポンス:** Bedrock Guardrail が呼び出しをブロックした場合、ゲートウェイは内部セキュリティルールの詳細を露見させることなく、RFC 7807 形式のエラー（`HTTP 400 Bad Request`）を返却しなければならない（MUST）：

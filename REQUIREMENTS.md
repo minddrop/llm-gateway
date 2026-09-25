@@ -365,6 +365,7 @@ Incoming Developer Payload (Prompts / Code / Diffs / Tool Outputs)
 
 * **`[FR-DLP-05]` Amazon Bedrock Guardrails Integration:**
   * All interactive developer prompts targeting Amazon Bedrock Runtime MUST pass the active Guardrail identifier and version (`guardrailIdentifier` and `guardrailVersion`) in the upstream invocation request.
+  * **Bedrock Mantle Exclusion:** Bedrock Mantle (`bedrock-mantle.<region>.api.aws`) does **not** natively support Bedrock Guardrails. Requests routed to `bedrock-mantle` bypass Tier 2 Guardrails and rely on Tier 1 Edge DLP and Tier 3 Post-Flight SSE filtering.
   * **Prompt Attack Defense:** The Guardrail MUST enforce **HIGH** strength filtering on prompt attacks, preventing adversarial jailbreaks from overriding corporate system instructions.
   * **Denied Topics:** The Guardrail MUST enforce strict topic policies blocking generation of malware payloads, remote exploitation scripts, or credential harvesting tools.
   * **Intervention Response:** If a Bedrock Guardrail blocks an interaction, the gateway MUST return an `HTTP 400 Bad Request` with an RFC 7807 payload detailing the guardrail action without exposing internal security rule internals:

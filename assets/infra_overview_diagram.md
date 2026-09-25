@@ -47,12 +47,14 @@ The platform is deployed in a dedicated, greenfield isolated VPC (`10.100.0.0/16
 * **Aurora PostgreSQL Serverless v2:** Multi-AZ authoritative datastore scaling elastically (2.0 to 32.0 ACUs) for users, virtual key hashes, and FinOps ledger transactions.
 
 ### Upstream Model & Management Tier (`Endpoint Subnets` / PrivateLink)
-* **AWS PrivateLink Interface Endpoints:** Dedicated private ENIs for zero-egress communication with AWS services.
+* **AWS PrivateLink Interface Endpoints (`sn-vpce-1a/1c/1d`):** Dedicated private ENIs deployed across the endpoint subnets for zero-egress communication with AWS services.
 * **Amazon Bedrock Runtime & Mantle:** Upstream Foundation Models deployed across Japan Sovereign Boundaries (`jp.*` cross-region profiles & Tokyo in-region models).
-* **Tier 2: Amazon Bedrock Guardrails:** Natively integrated into **Amazon Bedrock Runtime** calls via `guardrailIdentifier` and `guardrailVersion`. Evaluates Prompt Attack defense at **HIGH** filter strength, denied topic policies, and Japan PII redaction (My Number / credit cards). There is **no separate VPC endpoint** for Guardrails; all invocations route through the `com.amazonaws.ap-northeast-1.bedrock-runtime` PrivateLink endpoint.
+* **Tier 2: Amazon Bedrock Guardrails:** Natively integrated into **Amazon Bedrock Runtime** calls via `guardrailIdentifier` and `guardrailVersion`. Evaluates Prompt Attack defense at **HIGH** filter strength, denied topic policies, and Japan PII redaction (My Number / credit cards). There is **no separate VPC endpoint** for Guardrails; all invocations route through the `com.amazonaws.ap-northeast-1.bedrock-runtime` PrivateLink endpoint and Guardrails is evaluated inside the Bedrock service plane.
+* **Bedrock Mantle Guardrail Exclusion:** Bedrock Mantle (`bedrock-mantle.ap-northeast-1.api.aws`) does **not** natively support Bedrock Guardrails. Mantle traffic connects directly via the Bedrock interface endpoint and completely bypasses Tier 2 Guardrails, relying exclusively on Tier 1 Edge DLP and Tier 3 SSE filtering.
 * **FinOps Optimization:** Interactive developer chat and coding prompts enforce Tier 2 Guardrails. High-throughput codebase embeddings (`amazon.titan-embed-text-v2`) bypass Tier 2 Guardrails to eliminate cost amplification ($0.75/1k text units).
 * **Secrets & Encryption:** AWS Secrets Manager for model credentials; KMS Multi-Region Customer Managed Keys (`mrk-llm-gw`) for envelope encryption.
-* **Audit & Storage:** CloudWatch Logs (zero payload, SHA-256 prompt hashes only) and S3 Parquet/WORM buckets with Object Lock.
+* **Audit & Storage:** CloudWatch Logs (zero payload, SHA-256 prompt hashes only) via `com.amazonaws.ap-northeast-1.logs` Interface Endpoints in `sn-vpce`, and S3 Parquet/WORM buckets with Object Lock via `com.amazonaws.ap-northeast-1.s3` Gateway Endpoint attached to `rt-app`.
+* **Database Connection Integrity:** ECS Fargate tasks connect exclusively to **AWS RDS Proxy** (`sn-data`) for PostgreSQL connection multiplexing, never directly to Aurora. ElastiCache Serverless is accessed independently via TCP 6379.
 
 ### Disaster Recovery Tier (AWS Osaka `ap-northeast-3`)
 * **Warm Standby:** Asynchronous cross-region storage replication via **Aurora Global Database** (RPO < 1 min) and S3 Cross-Region Replication (CRR).

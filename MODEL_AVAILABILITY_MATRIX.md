@@ -194,3 +194,7 @@ Below is the verified survey of Foundation Models across both Bedrock execution 
 
 9. **OpenAI & xAI Dual-Plane Availability:**
    * OpenAI (`GPT-6 Astra`, `GPT-5.6 Sol / Terra / Luna`) and xAI (`Grok 4.6`) are available on both `bedrock-mantle` (US-West-2) and `bedrock-runtime` (via `/openai/v1`). Both providers egress Japan and require Tier 3 waivers.
+
+10. **Amazon Bedrock Guardrails Support Matrix:**
+    * **Bedrock Guardrails is supported exclusively on `bedrock-runtime`.** Prompts targeting `bedrock-runtime` models apply Tier 2 Guardrails (`guardrailIdentifier` and `guardrailVersion`).
+    * **`bedrock-mantle` does NOT support native Bedrock Guardrails.** Calls routed to `bedrock-mantle` bypass Tier 2 Guardrails and are protected solely by Tier 1 In-Memory Edge DLP and Tier 3 Post-Flight SSE stream transformers.
